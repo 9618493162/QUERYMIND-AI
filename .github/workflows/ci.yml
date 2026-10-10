@@ -1,0 +1,737 @@
+# QueryMind AI — continuous integration.
+#
+# Jobs
+#   detect-changes .............. decides whether the live (model) checks are relevant
+#   backend-tests ............... full pytest suite (minus live_llm) against real PostgreSQL
+#   frontend-checks ............. vitest, tsc --noEmit, production build
+#   security-suite .............. SQL validation, auth, credential and read-only gates
+#   failure-path-verification ... unreachable DB / unreachable model error handling
+#   real-llm-live-verification .. real Ollama inference + the live end-to-end script
+#   verification-summary ........ single PASSED/FAILED/SKIPPED/BLOCKED report
+#
+# All credentials below are disposable values for the ephemeral containers started
+# from docker-compose.yml. No production secret, token or key is used or logged.
+---
+name: CI
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Run the live AI verification jobs"
+        type: choice
+        options: [auto, always, never]
+        default: auto
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs on the same branch, but never cancel a live model run
+  # that is already in progress on the default branch.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # --- application configuration (ephemeral CI values only) ------------------
+  APP_ENV: development
+  APP_SECRET_KEY: ci-only-session-secret-not-used-anywhere-else
+  ENCRYPTION_KEY: ci-only-encryption-passphrase-not-used-anywhere-else
+  DATABASE_URL: postgresql+psycopg://app_user:app_password_change_me@localhost:5434/querymind
+  FRONTEND_ORIGIN: http://localhost:5173
+  ALLOW_PRIVATE_DB_HOSTS: "true"
+  AI_PROVIDER: ollama
+  OLLAMA_BASE_URL: http://127.0.0.1:11434
+  OLLAMA_MODEL: qwen2.5-coder:7b
+  AI_TIMEOUT_SECONDS: "180"
+  QUERY_TIMEOUT_SECONDS: "15"
+  MAX_QUERY_ROWS: "1000"
+  # --- service endpoints used by the tests and verification scripts ----------
+  QM_ANALYTICS_HOST: localhost
+  QM_ANALYTICS_PORT: "5433"
+  QM_ANALYTICS_DB: analytics
+  QM_ANALYTICS_USER: analytics_owner
+  QM_ANALYTICS_PASSWORD: analytics_password_change_me
+  QM_APP_DB_HOST: localhost
+  QM_APP_DB_PORT: "5434"
+  QM_APP_DB_NAME: querymind
+  QM_APP_DB_USER: app_user
+  QM_APP_DB_PASSWORD: app_password_change_me
+  QM_TEST_DB_NAME: querymind_test
+  # Restricted SELECT-only role, provisioned by the security job.
+  QM_READONLY_HOST: localhost
+  QM_READONLY_PORT: "5433"
+  QM_READONLY_DB: analytics
+  QM_READONLY_USER: analytics_ro
+  QM_READONLY_PASSWORD: analytics_ro_change_me
+  # Alternate schema (application metadata database) used by the live E2E script.
+  SECOND_SCHEMA_HOST: localhost
+  SECOND_SCHEMA_PORT: "5434"
+  SECOND_SCHEMA_DB: querymind
+  SECOND_SCHEMA_USER: app_user
+  SECOND_SCHEMA_PASSWORD: app_password_change_me
+  BACKEND_URL: http://127.0.0.1:8001
+
+jobs:
+  detect-changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      live: ${{ steps.decide.outputs.live }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether live verification is required
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REQUESTED: ${{ github.event.inputs.live || 'auto' }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        # Invoked through `bash` so the check does not depend on the file mode
+        # surviving a Windows checkout, and .gitattributes keeps it LF for the
+        # Linux runners.
+        run: bash .github/scripts/detect-live-required.sh
+
+  backend-tests:
+    name: Backend tests (real PostgreSQL, migrations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start PostgreSQL services
+        run: docker compose up -d --wait postgres postgres-analytics
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Apply database migrations
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python -m alembic upgrade head
+          python -m alembic current
+          # Fails if the models and the migrations have drifted apart.
+          python -m alembic check
+
+      - name: Verify migrated schema exists
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import psycopg
+          dsn = os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://")
+          with psycopg.connect(dsn) as conn:
+              rows = conn.execute(
+                  "SELECT table_name FROM information_schema.tables "
+                  "WHERE table_schema = 'public' ORDER BY 1"
+              ).fetchall()
+          names = {r[0] for r in rows}
+          required = {
+              "users", "user_sessions", "user_settings", "database_connections",
+              "query_history", "saved_queries", "conversations", "conversation_messages",
+              "uploaded_datasets",
+          }
+          missing = required - names
+          assert not missing, f"migrations did not create: {sorted(missing)}"
+          print("migrated tables:", sorted(names))
+          PY
+
+      - name: Provision the SELECT-only role
+        run: |
+          set -euo pipefail
+          docker exec querymind-analytics-db psql -U analytics_owner -d analytics -v ON_ERROR_STOP=1 \
+            -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='analytics_ro') THEN CREATE ROLE analytics_ro LOGIN PASSWORD 'analytics_ro_change_me'; END IF; END \$\$;" \
+            -c "GRANT CONNECT ON DATABASE analytics TO analytics_ro;" \
+            -c "GRANT USAGE ON SCHEMA public TO analytics_ro;" \
+            -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO analytics_ro;" \
+            -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO analytics_ro;"
+
+      - name: Run backend test suite
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          mkdir -p ../reports
+          python -m pytest -m "not live_llm" -q \
+            --junitxml=../reports/pytest-backend.xml 2>&1 | tee ../reports/pytest-backend.txt
+
+      - name: Upload backend test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: reports/pytest-backend.*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop PostgreSQL services
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  frontend-checks:
+    name: Frontend tests, typecheck and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies from the lockfile
+        working-directory: frontend
+        run: npm ci
+
+      - name: TypeScript typecheck
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          mkdir -p ../reports
+          npm run typecheck 2>&1 | tee ../reports/typecheck.txt
+
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm test -- --reporter=verbose 2>&1 | tee ../reports/vitest.txt
+
+      - name: Production build
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm run build 2>&1 | tee ../reports/build.txt
+
+      - name: Upload frontend reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-reports
+          path: |
+            reports/vitest.txt
+            reports/typecheck.txt
+            reports/build.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+  security-suite:
+    name: Security gates (SQL validation, auth, credentials, read-only role)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start PostgreSQL services
+        run: docker compose up -d --wait postgres postgres-analytics
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Provision the SELECT-only role
+        run: |
+          set -euo pipefail
+          docker exec querymind-analytics-db psql -U analytics_owner -d analytics -v ON_ERROR_STOP=1 \
+            -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='analytics_ro') THEN CREATE ROLE analytics_ro LOGIN PASSWORD 'analytics_ro_change_me'; END IF; END \$\$;" \
+            -c "GRANT CONNECT ON DATABASE analytics TO analytics_ro;" \
+            -c "GRANT USAGE ON SCHEMA public TO analytics_ro;" \
+            -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO analytics_ro;"
+
+      - name: Verify the restricted role really is restricted
+        run: |
+          set -euo pipefail
+          docker exec -e PGPASSWORD=analytics_ro_change_me querymind-analytics-db \
+            psql -U analytics_ro -h 127.0.0.1 -d analytics -tAc "SELECT count(*) FROM orders"
+          if docker exec -e PGPASSWORD=analytics_ro_change_me querymind-analytics-db \
+               psql -U analytics_ro -h 127.0.0.1 -d analytics -tAc "DELETE FROM orders WHERE false" 2>/dev/null; then
+            echo "::error title=Security::the analytics_ro role was able to run DELETE"
+            exit 1
+          fi
+          echo "analytics_ro can read but cannot write."
+
+      - name: Run security test suites
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          mkdir -p ../reports
+          python -m pytest -q \
+            app/tests/test_sql_validator.py \
+            app/tests/test_auth.py \
+            app/tests/test_crypto_and_connections.py \
+            app/tests/test_csv_upload.py \
+            app/tests/test_read_only_enforcement.py \
+            --junitxml=../reports/pytest-security.xml 2>&1 | tee ../reports/pytest-security.txt
+
+      - name: Assert no security test was skipped
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse("../reports/pytest-security.xml")
+          skipped = [
+              tc.get("classname", "")
+              for tc in tree.iter("testcase")
+              if tc.find("skipped") is not None
+          ]
+          read_only = [name for name in skipped if "read_only" in name]
+          if read_only:
+              raise SystemExit(f"read-only enforcement tests were skipped: {read_only}")
+          if skipped:
+              print("Skipped (reported, non-blocking):", skipped)
+          print("No security test was silently skipped.")
+          PY
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/pytest-security.*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop PostgreSQL services
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  failure-path-verification:
+    name: Failure-path verification (unreachable database and model)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.live == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      # true when the harness itself could not run (exit code 2), so the summary
+      # can distinguish BLOCKED infrastructure from an application regression.
+      blocked: ${{ steps.failure_paths.outputs.blocked || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start PostgreSQL services
+        run: docker compose up -d --wait postgres postgres-analytics
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Apply database migrations
+        working-directory: backend
+        run: python -m alembic upgrade head
+
+      - name: Start the backend
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 \
+            > "$RUNNER_TEMP/logs/backend.log" 2>&1 &
+          disown || true
+          for attempt in $(seq 1 60); do
+            if curl -fsS "$BACKEND_URL/api/health" >/dev/null 2>&1; then
+              echo "backend ready after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Infrastructure::backend did not become ready in 60s"
+          tail -n 50 "$RUNNER_TEMP/logs/backend.log"
+          exit 1
+
+      - name: Run failure-path verification
+        id: failure_paths
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          set -o pipefail
+          mkdir -p ../reports
+          set +e
+          python scripts/live_failure_check.py --base-url "$BACKEND_URL" 2>&1 | tee ../reports/failure-paths.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            echo "::error title=Blocked by CI infrastructure::failure-path verification could not run its own harness (see reports/failure-paths.txt)"
+          elif [ "$code" -ne 0 ]; then
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+            echo "::error title=Application regression::failure-path verification reported failing checks"
+          else
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Enforce the failure-path result
+        env:
+          CODE: ${{ steps.failure_paths.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          case "${CODE:-1}" in
+            0) echo "Failure-path verification passed." ;;
+            2) echo "Failure-path verification is BLOCKED by infrastructure (not a pass)."; exit 1 ;;
+            *) echo "Failure-path verification FAILED."; exit 1 ;;
+          esac
+
+      - name: Backend log
+        if: always()
+        run: tail -n 200 "$RUNNER_TEMP/logs/backend.log" || true
+
+      - name: Upload failure-path reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-path-reports
+          path: |
+            reports/failure-paths.txt
+            ${{ runner.temp }}/logs/backend.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop services
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans
+          pkill -f "uvicorn app.main:app" || true
+
+  real-llm-live-verification:
+    name: Live verification (real Ollama model, real database)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.live == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      # true when the model server, the model or the backend could not be
+      # brought up — reported as BLOCKED rather than as a test failure.
+      blocked: ${{ steps.classify.outputs.blocked || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
+        id: ollama_install
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Cache the model
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-${{ runner.os }}-${{ env.OLLAMA_MODEL }}
+
+      - name: Start Ollama and pull the configured model
+        id: ollama
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          nohup ollama serve > "$RUNNER_TEMP/logs/ollama.log" 2>&1 &
+          disown || true
+          for attempt in $(seq 1 60); do
+            if curl -fsS "$OLLAMA_BASE_URL/api/tags" >/dev/null 2>&1; then
+              echo "ollama ready after ${attempt}s"
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error title=Infrastructure::Ollama server did not become ready"
+              tail -n 50 "$RUNNER_TEMP/logs/ollama.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if ! curl -fsS "$OLLAMA_BASE_URL/api/tags" | grep -q "\"${OLLAMA_MODEL%%:*}"; then
+            echo "Pulling $OLLAMA_MODEL (not present in the cache)"
+            ollama pull "$OLLAMA_MODEL" || {
+              echo "::error title=Infrastructure::could not pull $OLLAMA_MODEL"
+              exit 1
+            }
+          else
+            echo "$OLLAMA_MODEL restored from cache"
+          fi
+
+          # Verify the exact model name is served before any test relies on it.
+          models=$(ollama list | awk 'NR>1 {print $1}')
+          echo "$models"
+          if ! echo "$models" | grep -Fxq "$OLLAMA_MODEL"; then
+            echo "::error title=Infrastructure::model $OLLAMA_MODEL is not available after pull"
+            exit 1
+          fi
+          echo "model_verified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify real inference responds
+        id: inference_smoke
+        run: |
+          set -euo pipefail
+          curl -fsS "$OLLAMA_BASE_URL/api/generate" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$OLLAMA_MODEL\",\"prompt\":\"reply with the word ready\",\"stream\":false}" \
+            | tee "$RUNNER_TEMP/logs/inference-smoke.json" | grep -q '"response"'
+          echo "Real inference smoke test succeeded."
+
+      - name: Start PostgreSQL services
+        run: docker compose up -d --wait postgres postgres-analytics
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Apply database migrations
+        working-directory: backend
+        run: python -m alembic upgrade head
+
+      - name: Start the backend
+        id: start_backend
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 \
+            > "$RUNNER_TEMP/logs/backend.log" 2>&1 &
+          disown || true
+          for attempt in $(seq 1 60); do
+            if curl -fsS "$BACKEND_URL/api/health" >/dev/null 2>&1; then
+              echo "backend ready after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Infrastructure::backend did not become ready in 60s"
+          tail -n 50 "$RUNNER_TEMP/logs/backend.log"
+          exit 1
+
+      - name: Confirm the provider the backend sees is the real model
+        run: |
+          set -euo pipefail
+          curl -fsS "$BACKEND_URL/api/health/ai" | tee "$RUNNER_TEMP/logs/health-ai.json"
+          python - "$RUNNER_TEMP/logs/health-ai.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          assert data.get("status") == "ok", f"AI provider not ok: {data}"
+          assert data.get("model"), f"no model reported: {data}"
+          print("provider:", data.get("provider"), "model:", data.get("model"))
+          PY
+
+      - name: Real LLM integration tests
+        id: llm_tests
+        continue-on-error: true
+        working-directory: backend
+        env:
+          REQUIRE_LIVE_LLM: "1"
+        run: |
+          set -o pipefail
+          mkdir -p ../reports
+          set +e
+          python -m pytest -m live_llm -q -rs \
+            --junitxml=../reports/pytest-live-llm.xml 2>&1 | tee ../reports/pytest-live-llm.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=Live LLM verification failed::real-model tests did not pass (REQUIRE_LIVE_LLM=1 forbids skipping)"
+          fi
+          exit 0
+
+      - name: Live end-to-end verification
+        id: live_e2e
+        continue-on-error: true
+        working-directory: backend
+        run: |
+          set -o pipefail
+          mkdir -p ../reports
+          set +e
+          python scripts/live_e2e_check.py --base-url "$BACKEND_URL" 2>&1 | tee ../reports/live-e2e.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=Live E2E verification failed::one or more mandatory checks failed"
+          fi
+          exit 0
+
+      - name: Enforcement summary
+        env:
+          LLM_CODE: ${{ steps.llm_tests.outputs.exit_code }}
+          E2E_CODE: ${{ steps.live_e2e.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          failed=0
+          if [ "${LLM_CODE:-1}" != "0" ]; then failed=1; fi
+          if [ "${E2E_CODE:-1}" != "0" ]; then failed=1; fi
+          {
+            echo "### Live model verification"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Model $OLLAMA_MODEL available | PASSED |"
+            echo "| Real inference smoke test | PASSED |"
+            echo "| \`pytest -m live_llm\` | $( [ "${LLM_CODE:-1}" = "0" ] && echo PASSED || echo FAILED ) |"
+            echo "| \`scripts/live_e2e_check.py\` | $( [ "${E2E_CODE:-1}" = "0" ] && echo PASSED || echo FAILED ) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -eq 1 ]; then
+            echo "A mandatory live check failed; this job is not a pass."
+            exit 1
+          fi
+          echo "All mandatory live checks passed."
+
+      - name: Classify infrastructure state
+        id: classify
+        if: always()
+        env:
+          INSTALL: ${{ steps.ollama_install.outcome }}
+          SERVE_MODEL: ${{ steps.ollama.outcome }}
+          SMOKE: ${{ steps.inference_smoke.outcome }}
+          BACKEND: ${{ steps.start_backend.outcome }}
+        run: |
+          set -euo pipefail
+          blocked=false
+          for outcome in "$INSTALL" "$SERVE_MODEL" "$SMOKE" "$BACKEND"; do
+            case "$outcome" in
+              failure*|cancelled) blocked=true ;;
+            esac
+          done
+          echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+          echo "install=$INSTALL serve/model=$SERVE_MODEL smoke=$SMOKE backend=$BACKEND -> blocked=$blocked"
+          if [ "$blocked" = "true" ]; then
+            echo "::warning title=Blocked by CI infrastructure::model or backend unavailable — results below are not a full verification"
+          fi
+
+      - name: Backend and Ollama logs
+        if: always()
+        run: |
+          echo "===== backend ====="; tail -n 100 "$RUNNER_TEMP/logs/backend.log" || true
+          echo "===== ollama ====="; tail -n 50 "$RUNNER_TEMP/logs/ollama.log" || true
+
+      - name: Upload live verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-verification-reports
+          path: |
+            reports/live-e2e.txt
+            reports/pytest-live-llm.txt
+            reports/pytest-live-llm.xml
+            ${{ runner.temp }}/logs/backend.log
+            ${{ runner.temp }}/logs/health-ai.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop services
+        if: always()
+        run: |
+          pkill -f "uvicorn app.main:app" || true
+          pkill -f "ollama serve" || true
+          docker compose down -v --remove-orphans
+
+  verification-summary:
+    name: Verification summary
+    needs:
+      - backend-tests
+      - frontend-checks
+      - security-suite
+      - failure-path-verification
+      - real-llm-live-verification
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report every job honestly
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS"])
+          labels = {
+              "backend-tests": "Backend tests (real PostgreSQL, migrations)",
+              "frontend-checks": "Frontend tests, typecheck, build",
+              "security-suite": "Security gates",
+              "failure-path-verification": "Failure-path verification",
+              "real-llm-live-verification": "Live model verification",
+          }
+          mapping = {
+              "success": "PASSED",
+              "failure": "FAILED",
+              "cancelled": "CANCELLED",
+              "skipped": "NOT RUN (not required for this change)",
+          }
+
+          def blocked_by_infrastructure(job):
+              outputs = (needs.get(job) or {}).get("outputs") or {}
+              value = outputs.get("blocked")
+              return str(value).lower() in ("true", "1")
+
+          lines = ["### QueryMind CI verification", "", "| Job | Result |", "| --- | --- |"]
+          blocking = []
+          blocked = []
+          for job, label in labels.items():
+              result = needs.get(job, {}).get("result", "unknown")
+              if result in ("failure", "cancelled"):
+                  if blocked_by_infrastructure(job):
+                      text = "BLOCKED BY CI INFRASTRUCTURE (not a pass)"
+                      blocked.append(label)
+                  else:
+                      text = mapping[result]
+                  blocking.append(label)
+              else:
+                  text = mapping.get(result, result.upper())
+              lines.append(f"| {label} | {text} |")
+
+          lines += [
+              "",
+              "Live model checks run only when the change touches backend, database,",
+              "security, verification-script or CI paths; otherwise they are reported",
+              "as not run rather than as passed.",
+          ]
+          if blocked:
+              lines += [
+                  "",
+                  "BLOCKED means the CI infrastructure (model server, database container or",
+                  "backend startup) was unavailable: the live checks did not execute and the",
+                  "run is NOT a full verification.",
+              ]
+          summary = "\n".join(lines)
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(summary + "\n")
+
+          if blocking:
+              print("Blocking jobs:", ", ".join(blocking))
+              print("Blocked by infrastructure:", ", ".join(blocked) or "none")
+              sys.exit(1)
+          PY

@@ -1,0 +1,21 @@
+# Keep the sources and CI tooling byte-identical across platforms.
+#
+# The verification scripts and workflows run on Linux runners: a CRLF copy of a
+# shell script fails with `\r: command not found`, so they are always checked
+# out with LF regardless of the developer's core.autocrlf setting.
+* text=auto
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.py    text eol=lf
+*.sql   text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# Binary assets must never be normalised.
+*.png   binary
+*.jpg   binary
+*.ico   binary

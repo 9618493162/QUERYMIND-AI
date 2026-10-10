@@ -1,0 +1,64 @@
+# QueryMind AI — local development services.
+#
+#   docker compose up -d                 -> app metadata DB (5432) + sample analytics DB (5433)
+#   docker compose --profile ollama up -d -> additionally start a local Ollama server (11434)
+#
+# The analytics database is SAMPLE DATA for development/verification only.
+# It is seeded from ./docker/analytics-init/01_sample_data.sql.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: querymind-app-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_password_change_me
+      POSTGRES_DB: querymind
+    ports:
+      # 5434 avoids clashing with other local Postgres containers (5432 is taken).
+      - "5434:5432"
+    volumes:
+      - app_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d querymind"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-analytics:
+    image: postgres:16-alpine
+    container_name: querymind-analytics-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: analytics_owner
+      POSTGRES_PASSWORD: analytics_password_change_me
+      POSTGRES_DB: analytics
+    ports:
+      - "5433:5432"
+    volumes:
+      - analytics_pgdata:/var/lib/postgresql/data
+      - ./docker/analytics-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics_owner -d analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional: run the LLM locally in Docker instead of a native Ollama install.
+  # Enable with:  docker compose --profile ollama up -d
+  # Then pull a model with:  docker compose --profile ollama exec ollama ollama pull qwen2.5-coder:7b
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    container_name: querymind-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+
+volumes:
+  app_pgdata:
+  analytics_pgdata:
+  ollama_models:

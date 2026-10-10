@@ -1,0 +1,15 @@
+== unreachable database ==
+[PASS] registered a throwaway user -- http=201
+[PASS] connection test reports the real failure -- Connection to 127.0.0.1:5599 timed out.
+[PASS] execution against an unreachable database fails loudly -- http=502 code=db_unreachable msg=Could not reach the database: Connection to 127.0.0.1:5599 timed out.
+[PASS] no fabricated rows returned for a failed execution
+
+== unreachable AI provider ==
+[PASS] AI health endpoint reports the provider as unavailable -- status=unavailable message=Cannot reach the Ollama server at http://127.0.0.1:5599 (ConnectError). Start it with 'ollama serve'
+[PASS] generation fails when the model is unreachable -- http=503 code=provider_unavailable
+[PASS] no SQL is fabricated when the model is unreachable -- sql=None
+[PASS] error explains that the AI provider is the problem -- Could not reach the AI provider: ConnectError.
+
+========================================================================
+FAILURE PATH CHECKS: 8/8 passed
+========================================================================
