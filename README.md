@@ -176,11 +176,13 @@ Mandatory values:
 | `DATABASE_URL` | application metadata database |
 | `AI_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | real model provider and model name |
 | `ENCRYPTION_KEY` | **required** to save connections — `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-| `FRONTEND_ORIGIN` | CORS/cookie origin, e.g. `http://localhost:5173` |
+| `FRONTEND_ORIGIN` | CORS/cookie origin(s), e.g. `http://localhost:5173` (comma-separate several) |
 
-Optional: `QUERY_TIMEOUT_SECONDS`, `MAX_QUERY_ROWS`, `MAX_RESULT_BYTES`, `ALLOW_PRIVATE_DB_HOSTS`, `DB_DESTINATION_ALLOWLIST`, `AUTH_RATE_LIMIT_PER_MINUTE`, `QUERY_RATE_LIMIT_PER_MINUTE`.
+Optional: `QUERY_TIMEOUT_SECONDS`, `MAX_QUERY_ROWS`, `MAX_RESULT_BYTES`, `ALLOW_PRIVATE_DB_HOSTS`, `DB_DESTINATION_ALLOWLIST`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `AUTH_RATE_LIMIT_PER_MINUTE`, `QUERY_RATE_LIMIT_PER_MINUTE`.
 
 The application refuses to store connections when `ENCRYPTION_KEY` is missing, instead of falling back to plaintext. `.env` is git-ignored.
+
+**Production configuration is validated at startup.** With `APP_ENV=production` the process refuses to start if `FRONTEND_ORIGIN` is not an explicit `https://` origin (a leading `*` wildcard or a `localhost` origin is rejected), or if cookies are explicitly marked non-Secure (`COOKIE_SECURE=false`). This prevents silently shipping credential cookies that the browser would drop or a wildcard CORS policy that would defeat them. See [config.py](backend/app/core/config.py).
 
 ### 5.2 Migrations
 
@@ -248,7 +250,7 @@ Tests are grouped with pytest markers (registered in [pytest.ini](backend/pytest
 | `live_llm` | needs the real AI provider and model — no mocks, ever |
 | `reads_only` | needs a restricted SELECT-only database role |
 
-The suite (114 tests) is: **111 fast tests** + **3 real-model tests**.
+The suite (120 tests) is: **117 fast tests** + **3 real-model tests**.
 
 ### Backend unit + integration tests (real PostgreSQL, no model needed)
 
@@ -298,7 +300,7 @@ These tests prove the database itself refuses writes (SELECT through the app wor
 
 ```bash
 cd frontend
-npm test          # vitest: 4 files, 18 tests
+npm test          # vitest: 5 files, 26 tests
 npm run typecheck
 npm run build
 ```
@@ -326,8 +328,8 @@ The pipeline lives in [.github/workflows/ci.yml](.github/workflows/ci.yml) with 
 | Job | What it proves | Runs |
 | --- | --- | --- |
 | `detect-changes` | decides whether the live checks are relevant to this change | always |
-| `Backend tests (real PostgreSQL, migrations)` | migrations + `alembic check` + 111 tests against real PostgreSQL (two databases), read-only role included | always |
-| `Frontend tests, typecheck and build` | `npm ci`, `tsc --noEmit`, 18 vitest tests, production build | always |
+| `Backend tests (real PostgreSQL, migrations)` | migrations + `alembic check` + 117 tests against real PostgreSQL (two databases), read-only role included | always |
+| `Frontend tests, typecheck and build` | `npm ci`, `tsc --noEmit`, 26 vitest tests, production build | always |
 | `Security gates (SQL validation, auth, credentials, read-only role)` | parser allowlist, auth/ownership, credential handling, CSV upload, read-only role — and fails if those tests were skipped | always |
 | `Failure-path verification (unreachable database and model)` | real error responses, no fabricated SQL/rows | live-relevant changes only |
 | `Live verification (real Ollama model, real database)` | real inference, `pytest -m live_llm`, `scripts/live_e2e_check.py` | live-relevant changes only |
@@ -503,7 +505,8 @@ Errors use a consistent envelope:
 
 - **Credentials** — Fernet-encrypted at rest; only `has_password` is exposed; the password is never sent back to the browser or written to history.
 - **Sessions** — opaque random tokens, HttpOnly/SameSite=Lax cookies, SHA-256 hashed server-side, expiry 7 days, `Secure` in production.
-- **CSRF** — double-submit token (`querymind_csrf` cookie + `x-csrf-token` header) enforced on all mutating routes.
+- **CSRF** — double-submit token (`querymind_csrf` cookie + `x-csrf-token` header) enforced on all mutating routes. The browser client bootstraps the cookie at most once and never sends a mutation without a token; a `401` clears the latch so an expired session can recover.
+- **Startup configuration gate** — production startup fails on an insecure CORS/cookie configuration instead of running with it.
 - **Authorization** — every connection, history entry, saved query, conversation, dataset and settings row is scoped by `user_id`; another user's resource returns 404.
 - **SQL safety** — parse-tree allowlist (`sqlglot`), single statement only, schema/table/column existence checks, re-validation before execution, read-only session and SELECT-only role guidance.
 - **Resource limits** — statement timeout (15 s default), row cap (1000), response byte cap (5 MB), per-user rate limits, request-size limits.
@@ -516,10 +519,12 @@ Errors use a consistent envelope:
 
 Executed on 2026-10-10 on Windows with Docker Desktop (PostgreSQL 16.14), Ollama `qwen2.5-coder:7b` and the sample analytics database.
 
+Re-verified on 2026-10-11 after the CSRF/cookie hardening change: the fast backend suite reported **114 passed, 3 skipped, 3 deselected** (exit 0) — the 3 skips are the SELECT-only-role tests, which skip with an explicit reason when `QM_READONLY_*` is unset and are never counted as passes — and the frontend reported **26 passed** (5 files) with a clean `tsc --noEmit` and production build.
+
 | Check | Result |
 | --- | --- |
-| Backend test suite | 114 tests: 111 fast + 3 real-model |
-| Frontend tests / typecheck / build | 18 passed, typecheck clean, production build succeeds |
+| Backend test suite | 120 tests: 117 fast + 3 real-model |
+| Frontend tests / typecheck / build | 26 passed, typecheck clean, production build succeeds |
 | Live end-to-end (real model, real DB, two different schemas) | 46/46 checks passed |
 | Failure paths (unreachable DB / unreachable model) | 8/8 checks passed (a harness outage exits 2 as BLOCKED instead of passing) |
 
@@ -584,7 +589,7 @@ Deployment has **not** been performed or verified as part of this work; the step
 - Schema caches live in process memory (5-minute TTL). Multi-worker deployments refresh per worker; use `?refresh=true` to force.
 - CSV uploads create tables in a dedicated uploads schema and are not scanned for PII.
 - Conversation context is limited to the recent turns and is treated as untrusted input.
-- Rate limiting is in-process per user/IP, so a multi-instance deployment needs a shared store (e.g. Redis).
+- Rate limiting is in-process per user/IP, so a multi-instance deployment needs a shared store (e.g. Redis); see [docs/rate-limiting.md](docs/rate-limiting.md) for the current behaviour, its limitations and the recommended migration path.
 - Chart support covers bar, line, area and pie; other visualisations would need new components.
 
 ---
@@ -626,7 +631,7 @@ querymind-ai/
 |   |-- vite.config.ts
 |   `-- tsconfig.json
 |-- docker/analytics-init/  # sample analytics data (development only)
-|-- docs/                   # recorded verification evidence
+|-- docs/                   # rate-limiting notes and recorded verification evidence
 |-- .github/
 |   |-- workflows/ci.yml    # CI pipeline
 |   `-- scripts/            # change-detection helper used by CI

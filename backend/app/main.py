@@ -92,7 +92,9 @@ def create_app() -> FastAPI:
         return response
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[settings.frontend_origin],
+        # Explicit allowlist only: a wildcard origin is refused by config
+        # validation in production because credentials (cookies) are enabled.
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type", "X-CSRF-Token", "X-Requested-With"],

@@ -124,6 +124,81 @@ def test_rate_limiting_on_login(client: TestClient):
     assert 429 in statuses, f"expected rate limiting, got {statuses}"
 
 
+def _production_settings(**overrides):
+    """A valid production Settings object with individual values overridable."""
+    from app.core.config import Settings
+
+    base = dict(
+        app_env="production",
+        app_secret_key="prod-secret-key-abc123notforrealdeploy",
+        encryption_key="test-encryption-key-0123456789abcdef",
+        frontend_origin="https://app.example.com",
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def test_production_requires_https_origin():
+    """Production must not silently run with an insecure frontend origin."""
+    prod_http = _production_settings(frontend_origin="http://example.com")
+    assert prod_http.is_production
+    problems = prod_http.validate_for_runtime()
+    assert any("https://" in p for p in problems), problems
+
+
+def test_production_rejects_wildcard_and_loopback_origins():
+    wildcard = _production_settings(frontend_origin="*")
+    assert any("'*'" in p for p in wildcard.validate_production_security())
+
+    loopback = _production_settings(frontend_origin="https://localhost:5173")
+    assert any("localhost" in p for p in loopback.validate_production_security())
+
+
+def test_production_accepts_explicit_https_origins():
+    prod = _production_settings(
+        frontend_origin="https://app.example.com,https://admin.example.com/"
+    )
+    assert prod.cors_origins == ["https://app.example.com", "https://admin.example.com"]
+    assert prod.validate_production_security() == []
+
+
+def test_production_rejects_insecure_cookie_overrides():
+    insecure = _production_settings(cookie_secure=False)
+    assert any("Secure" in p for p in insecure.validate_production_security())
+
+    samesite_none = _production_settings(cookie_secure=True, cookie_samesite="none")
+    assert samesite_none.cookies_are_secure is True
+    assert samesite_none.validate_production_security() == []
+
+
+def test_development_is_not_gated_on_https():
+    from app.core.config import Settings
+
+    dev = Settings(app_env="development", frontend_origin="http://localhost:5173")
+    assert dev.is_production is False
+    assert dev.cookies_are_secure is False
+    assert dev.validate_production_security() == []
+
+
+def test_secure_cookies_are_configured_for_production(monkeypatch):
+    """In production the session and CSRF cookies must be marked Secure."""
+    from app.core import security as security_module
+    from app.core.security import csrf_cookie_kwargs, session_cookie_kwargs
+
+    # The test environment is not production, so cookies are not Secure.
+    assert session_cookie_kwargs()["secure"] is False, session_cookie_kwargs()
+    assert csrf_cookie_kwargs()["secure"] is False, csrf_cookie_kwargs()
+
+    monkeypatch.setattr(security_module.settings, "app_env", "production")
+
+    assert session_cookie_kwargs()["secure"] is True, session_cookie_kwargs()
+    assert session_cookie_kwargs()["httponly"] is True
+    assert session_cookie_kwargs()["samesite"] == "lax"
+    assert csrf_cookie_kwargs()["secure"] is True, csrf_cookie_kwargs()
+    # The CSRF cookie must stay readable by the SPA to echo it in a header.
+    assert csrf_cookie_kwargs()["httponly"] is False
+
+
 def test_ownership_isolation_between_users(client: TestClient):
     # user A
     client.get("/api/health")
