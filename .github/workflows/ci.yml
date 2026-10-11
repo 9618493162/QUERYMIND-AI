@@ -676,7 +676,7 @@ jobs:
           python3 - <<'PY'
           import json, os, sys
 
-          needs = json.loads(os.environ["NEEDS"])
+          needs = json.loads(os.environ.get("NEEDS", "[]"))
           labels = {
               "backend-tests": "Backend tests (real PostgreSQL, migrations)",
               "frontend-checks": "Frontend tests, typecheck, build",

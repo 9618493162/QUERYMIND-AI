@@ -348,6 +348,8 @@ The workflow uses only first-party actions (`actions/checkout`, `setup-python`, 
 | PR against an unavailable base branch | `live=true` (conservative) |
 | `workflow_dispatch` with `live=always` / `never` | `true` / `false` |
 
+The table above is the *documentation* form of the same logic the CI runs; the script behind it is [.github/scripts/detect-live-required.sh](.github/scripts/detect-live-required.sh), which emits only `true` or `false` (no reasons) so the workflow can treat it as a boolean `if:` condition.
+
 ### Exact commands (local equivalents of every CI step)
 
 ```bash
@@ -404,10 +406,12 @@ CI uses only disposable credentials for the ephemeral containers it starts; ther
 
 | State | How it is reported |
 | --- | --- |
-| Passed | job green, check listed as PASSED in the summary |
-| Failed | job red, `::error` annotation naming the check |
-| Not run (not required for this change) | job skipped, summary says `NOT RUN`, never `PASSED` |
-| Blocked by CI infrastructure | `scripts/live_failure_check.py` exits `2`, job fails with a `Blocked by CI infrastructure` annotation (never a pass) |
+| Passed | job green, summary row `PASSED` |
+| Failed | job red, `::error` annotation naming the regression, summary row `FAILED` |
+| Not executed (not required for this change) | job skipped, summary row `NOT RUN (not required for this change)` — never `PASSED` |
+| Blocked by CI infrastructure | the job fails **and** the summary row reads `BLOCKED BY CI INFRASTRUCTURE (not a pass)`, with a footnote explaining that the live checks never ran |
+
+The two live jobs expose a `blocked` output (the failure-path script's exit code `2`, and the outcome of the Ollama/backend startup steps), which is what lets the summary tell an infrastructure outage apart from an application regression.
 
 ### Reports and artifacts
 
@@ -463,7 +467,7 @@ Then, in the repository: **Settings → Actions → General** (allow Actions), a
 
 ### Verification status of this pipeline
 
-- **Validated locally:** workflow YAML parses; `actionlint` (v1.7.7) reports **no findings** including shellcheck on every `run:` block; the change-detection helper was exercised against real git histories; `docker compose up -d --wait` returns 0 with both databases healthy; `npm ci --dry-run` shows the lockfile is in sync; `alembic upgrade head` + `alembic check` report no drift; the security skip-gate passes when the read-only role exists and **fails** when it does not; `ollama list` parsing finds `qwen2.5-coder:7b`; and `REQUIRE_LIVE_LLM` was proven to fail (not skip) with the model unreachable.
+- **Validated locally:** workflow YAML parses; `actionlint` (v1.7.7) reports **no findings** including shellcheck on every `run:` block; the change-detection helper was exercised against real git histories; `docker compose up -d --wait` returns 0 with both databases healthy; `npm ci --dry-run` shows the lockfile is in sync; `alembic upgrade head` + `alembic check` report no drift; the security skip-gate passes when the read-only role exists and **fails** when it does not; `ollama list` parsing finds `qwen2.5-coder:7b`; `REQUIRE_LIVE_LLM` was proven to fail (not skip) with the model unreachable; and the summary script extracted from the workflow was executed against three synthetic job graphs — green with live checks not required (exit 0, `NOT RUN`), a fast-test regression (exit 1, `FAILED`), and an infrastructure outage (exit 1, `BLOCKED BY CI INFRASTRUCTURE (not a pass)`).
 - **Not yet validated remotely:** this environment has no GitHub repository, so **no GitHub Actions run has been executed**. The Ollama install/cache steps in particular only exist on Linux runners and have not been executed anywhere. Treat the first `workflow_dispatch` run as the real validation.
 
 ## 9. API
