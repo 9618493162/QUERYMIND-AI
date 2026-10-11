@@ -1,0 +1,163 @@
+# QueryMind AI — production stack (single host, TLS terminated by Caddy).
+#
+#   Browser ──HTTPS──> caddy ──/api/*──> backend ──> postgres   (internal only)
+#                            └──/* ────> React SPA   └─> ollama  (internal only)
+#
+# Everything is same-origin: the only published ports are Caddy's 80/443.
+# PostgreSQL, Ollama and the FastAPI container are reachable on the internal
+# network only, and no credential is hardcoded — every secret comes from
+# .env.production and the required ones fail fast when unset.
+#
+# Usage (see docs/deployment.md for the full runbook):
+#   cp .env.production.example .env.production   # fill it in, never commit it
+#   docker compose --env-file .env.production -f docker-compose.prod.yml \
+#     --profile tools run --rm migrate           # explicit migration step
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# Migrations are NEVER applied automatically on startup: `migrate` only exists
+# under the `tools` profile, so a plain `up` can never alter the schema.
+
+name: querymind
+
+services:
+  # --------------------------------------------------------------------------
+  # Application metadata database (users, connections, history, saved queries)
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env.production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Deliberately NOT published: the database is reachable only on the
+    # internal network. Never expose it to the internet.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - internal
+
+  # --------------------------------------------------------------------------
+  # Real LLM inference (Ollama). Needs ~8 GB RAM and ~5 GB disk for a 7B model.
+  # The model is pulled once, explicitly (see docs/deployment.md).
+  # --------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    expose:
+      - "11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+
+  # --------------------------------------------------------------------------
+  # FastAPI backend (built from backend/Dockerfile, started after Postgres).
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: querymind-backend:latest
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      # Values that must match the compose network rather than a developer's .env.
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+      OLLAMA_BASE_URL: http://ollama:11434
+      # Only the reverse proxy may set forwarding headers. Anything else is a
+      # client-supplied header and must never influence the rate limiter.
+      TRUSTED_PROXY_IPS: ${COMPOSE_SUBNET:-172.28.0.0/24}
+      PORT: "8001"
+    expose:
+      - "8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - internal
+
+  # --------------------------------------------------------------------------
+  # Caddy: HTTPS, static SPA, /api/* reverse proxy. The only public service.
+  # --------------------------------------------------------------------------
+  caddy:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+    image: querymind-web:latest
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${DOMAIN:?set DOMAIN in .env.production}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env.production}
+      BACKEND_UPSTREAM: backend:8001
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      - backend
+    networks:
+      - internal
+
+  # --------------------------------------------------------------------------
+  # Explicit, one-shot migration runner. Never started by `up` (tools profile).
+  # --------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: querymind-backend:latest
+    profiles: ["tools"]
+    restart: "no"
+    env_file:
+      - .env.production
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  ollama_models:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    # A fixed subnet makes TRUSTED_PROXY_IPS deterministic. Override with
+    # COMPOSE_SUBNET in .env.production if 172.28.0.0/24 is already in use.
+    ipam:
+      config:
+        - subnet: ${COMPOSE_SUBNET:-172.28.0.0/24}

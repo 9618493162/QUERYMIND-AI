@@ -14,6 +14,12 @@
 *.tsx   text eol=lf
 *.json  text eol=lf
 *.md    text eol=lf
+# Container, proxy and env files must stay LF as well: a CRLF Dockerfile breaks
+# line continuations, and Caddy/env files are sourced by Linux tooling.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+Caddyfile text eol=lf
+.env* text eol=lf
 
 # Binary assets must never be normalised.
 *.png   binary

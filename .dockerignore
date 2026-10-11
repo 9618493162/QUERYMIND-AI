@@ -1,0 +1,53 @@
+# Build context exclusions for every image built from the repository root.
+#
+# Anything listed here is NOT sent to the Docker daemon, so secrets, virtual
+# environments, Git history and build caches can never end up in a layer.
+
+# --- version control / CI metadata -----------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- secrets and environment files ----------------------------------------
+# Never bake credentials into an image. Only the placeholder templates ship.
+# NOTE: a pattern without `**/` only matches the context root in
+# .dockerignore, so every rule here is explicitly recursive.
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.production.example
+**/*.pem
+**/*.key
+
+# --- Python virtualenvs and caches ----------------------------------------
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/*.egg-info
+
+# --- Node dependencies and build output -----------------------------------
+# The web image builds its own assets inside the build stage.
+**/node_modules
+**/dist
+**/.vite
+
+# --- generated reports / coverage -----------------------------------------
+reports
+**/coverage
+**/.coverage
+**/htmlcov
+**/*.junit.xml
+
+# --- documentation and local-only fixtures --------------------------------
+docs
+docker/analytics-init
+
+# --- editor / OS noise -----------------------------------------------------
+**/*.log
+**/.DS_Store
+**/Thumbs.db
+**/.idea
+**/.vscode

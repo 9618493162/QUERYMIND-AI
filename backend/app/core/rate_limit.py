@@ -3,8 +3,11 @@
 Behavior
 --------
 - Fixed window of one minute per key.
-- Keys are built as ``bucket:client_key`` where the client key is taken from
-  ``X-Forwarded-For`` (first entry) if present, otherwise the direct client IP.
+- Keys are built as ``bucket:client_key``. The client key is the direct peer
+  address, unless that peer is a configured trusted proxy
+  (``TRUSTED_PROXY_IPS``), in which case ``X-Forwarded-For`` is walked from
+  right to left and the first untrusted address is used. The header is ignored
+  entirely when no trusted proxy is configured.
 - When the limit is exceeded the request is rejected immediately with a 429.
 - The limiter is process-local: each uvicorn worker/instance keeps its own
   hit counters.
@@ -40,12 +43,15 @@ needed, add it explicitly and migrate callers behind the existing
 
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from collections import defaultdict
+from functools import lru_cache
 
 from fastapi import Request
 
+from app.core.config import settings
 from app.core.errors import ApiError
 
 _lock = threading.Lock()
@@ -53,11 +59,56 @@ _hits: dict[str, list[float]] = defaultdict(list)
 _WINDOW_SECONDS = 60.0
 
 
+@lru_cache(maxsize=8)
+def _trusted_networks(spec: str) -> tuple[ipaddress._BaseNetwork, ...]:
+    """Parse the configured trusted proxies (plain IPs and CIDRs)."""
+    networks: list[ipaddress._BaseNetwork] = []
+    for entry in (p.strip() for p in spec.split(",")):
+        if not entry:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            continue
+    return tuple(networks)
+
+
+def _is_trusted(ip: ipaddress._BaseAddress, networks: tuple[ipaddress._BaseNetwork, ...]) -> bool:
+    return any(ip in net for net in networks)
+
+
 def client_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Identify the client for rate limiting.
+
+    ``X-Forwarded-For`` is client-controlled, so it is only believed when the
+    immediate peer is a configured trusted proxy. The chain is then walked from
+    right to left (the direction our own proxy appends to), skipping trusted
+    hops, and the first untrusted address wins. A spoofed left-most entry is
+    therefore ignored, and with no trusted proxy configured the header is
+    ignored entirely.
+    """
+    peer = request.client.host if request.client else None
+    if not peer:
+        return "unknown"
+
+    networks = _trusted_networks(settings.trusted_proxy_ips)
+    try:
+        peer_ip: ipaddress._BaseAddress | None = ipaddress.ip_address(peer)
+    except ValueError:
+        peer_ip = None
+
+    if not networks or peer_ip is None or not _is_trusted(peer_ip, networks):
+        return peer
+
+    forwarded = request.headers.get("x-forwarded-for") or ""
+    for candidate in reversed([p.strip() for p in forwarded.split(",") if p.strip()]):
+        try:
+            candidate_ip = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue  # unparseable hop: skip rather than trust it
+        if not _is_trusted(candidate_ip, networks):
+            return candidate
+    return peer
 
 
 def check_rate_limit(bucket: str, key: str, limit_per_minute: int) -> None:
