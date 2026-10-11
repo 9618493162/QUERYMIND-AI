@@ -1,7 +1,41 @@
 """Minimal in-process fixed-window rate limiter (per key, per minute).
 
-Kept dependency-free and process-local; suitable for a single-instance
-deployment. For multi-instance deployments swap for a shared store.
+Behavior
+--------
+- Fixed window of one minute per key.
+- Keys are built as ``bucket:client_key`` where the client key is taken from
+  ``X-Forwarded-For`` (first entry) if present, otherwise the direct client IP.
+- When the limit is exceeded the request is rejected immediately with a 429.
+- The limiter is process-local: each uvicorn worker/instance keeps its own
+  hit counters.
+
+Limitations
+-----------
+- Because counters are in-memory and per-process, they do NOT coordinate across
+  multiple application instances or multiple workers. In a multi-instance or
+  multi-worker deployment the effective limit is roughly
+  ``limit_per_minute * number_of_workers_or_instances`` for the same client.
+- The in-process store is unbounded in the number of distinct keys seen over
+  time. Under very high cardinality (many distinct client keys) memory can grow
+  slowly; the current codebase relies on restarts and low key diversity for now.
+
+When this is enough
+-------------------
+- Single-instance or single-worker deployments.
+- Local development and the current CI approach.
+- Defense-in-depth throttling where a shared store is not required.
+
+When to replace it
+------------------
+- If you run more than one application instance or worker and want a real
+  per-client limit, move the limiter to a shared store (for example Redis) or
+  push rate limiting to the edge/proxy layer (for example a CDN or load
+  balancer) before requests reach the app.
+- If you want cross-process correctness today, do not rely on this module alone.
+
+No new dependency is introduced by this module; if/when a shared store is
+needed, add it explicitly and migrate callers behind the existing
+``rate_limit(...)`` interface.
 """
 
 from __future__ import annotations

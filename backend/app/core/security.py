@@ -71,10 +71,16 @@ def session_expiry() -> datetime:
 
 
 def session_cookie_kwargs() -> dict:
+    """Session cookie parameters.
+
+    The Secure flag is enabled in production. Combined with
+    ``CORSMiddleware(allow_credentials=True)`` and an ``https://`` frontend
+    origin, the browser will only send the cookie over HTTPS.
+    """
     return dict(
         httponly=True,
-        secure=settings.is_production,
-        samesite="lax",
+        secure=settings.cookies_are_secure,
+        samesite=settings.cookie_samesite,
         max_age=SESSION_TTL_DAYS * 24 * 3600,
         path="/",
     )
@@ -82,10 +88,12 @@ def session_cookie_kwargs() -> dict:
 
 def csrf_cookie_kwargs() -> dict:
     # Readable by the frontend so it can echo the token in headers.
+    # The Secure flag is still required in production for the same reason as
+    # the session cookie: credentials + CORS demand HTTPS.
     return dict(
         httponly=False,
-        secure=settings.is_production,
-        samesite="lax",
+        secure=settings.cookies_are_secure,
+        samesite=settings.cookie_samesite,
         max_age=SESSION_TTL_DAYS * 24 * 3600,
         path="/",
     )
