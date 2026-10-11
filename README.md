@@ -348,7 +348,7 @@ The workflow uses only first-party actions (`actions/checkout`, `setup-python`, 
 | PR against an unavailable base branch | `live=true` (conservative) |
 | `workflow_dispatch` with `live=always` / `never` | `true` / `false` |
 
-The table above is the *documentation* form of the same logic the CI runs; the script behind it is [.github/scripts/detect-live-required.sh](.github/scripts/detect-live-required.sh), which emits only `true` or `false` (no reasons) so the workflow can treat it as a boolean `if:` condition.
+The table above is the *documentation* form of the same logic the CI runs; the script behind it is [.github/scripts/detect-live-required.sh](.github/scripts/detect-live-required.sh), driven purely by environment variables (`EVENT`, `REQUESTED`, `BASE_REF`, `BEFORE`, `SHA`) and emitting a `live=<bool>` line to stdout and to `$GITHUB_OUTPUT`, which is what the workflow's `if:` conditions gate on.
 
 ### Exact commands (local equivalents of every CI step)
 
