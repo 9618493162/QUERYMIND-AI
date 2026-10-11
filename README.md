@@ -119,6 +119,7 @@ flowchart LR
 | API routes | [health.py](backend/app/api/health.py), [auth.py](backend/app/api/auth.py), [connections.py](backend/app/api/connections.py), [query.py](backend/app/api/query.py), [history.py](backend/app/api/history.py), [saved_queries.py](backend/app/api/saved_queries.py), [conversations.py](backend/app/api/conversations.py), [analytics.py](backend/app/api/analytics.py), [settings.py](backend/app/api/settings.py), [uploads.py](backend/app/api/uploads.py) |
 | Services | [ai_service.py](backend/app/services/ai_service.py), [sql_generator.py](backend/app/services/sql_generator.py), [sql_validator.py](backend/app/services/sql_validator.py), [schema_service.py](backend/app/services/schema_service.py), [query_executor.py](backend/app/services/query_executor.py), [chart_service.py](backend/app/services/chart_service.py), [csv_service.py](backend/app/services/csv_service.py), [connection_service.py](backend/app/services/connection_service.py), [crypto.py](backend/app/services/crypto.py), [db_errors.py](backend/app/services/db_errors.py), [history_service.py](backend/app/services/history_service.py) |
 | Security | [security.py](backend/app/core/security.py), [deps.py](backend/app/core/deps.py), [network_policy.py](backend/app/security/network_policy.py), [rate_limit.py](backend/app/core/rate_limit.py) |
+| Deployment | [docker-compose.prod.yml](docker-compose.prod.yml), [backend/Dockerfile](backend/Dockerfile), [docker/web/Dockerfile](docker/web/Dockerfile), [docker/caddy/Caddyfile](docker/caddy/Caddyfile), [docs/deployment.md](docs/deployment.md) |
 | Frontend | [App.tsx](frontend/src/App.tsx), [pages/](frontend/src/pages), [components/](frontend/src/components), [contexts/](frontend/src/contexts), [services/api.ts](frontend/src/services/api.ts), [types/api.ts](frontend/src/types/api.ts) |
 
 ---
@@ -250,7 +251,7 @@ Tests are grouped with pytest markers (registered in [pytest.ini](backend/pytest
 | `live_llm` | needs the real AI provider and model — no mocks, ever |
 | `reads_only` | needs a restricted SELECT-only database role |
 
-The suite (120 tests) is: **117 fast tests** + **3 real-model tests**.
+The suite (145 tests) is: **142 fast tests** + **3 real-model tests**.
 
 ### Backend unit + integration tests (real PostgreSQL, no model needed)
 
@@ -328,7 +329,7 @@ The pipeline lives in [.github/workflows/ci.yml](.github/workflows/ci.yml) with 
 | Job | What it proves | Runs |
 | --- | --- | --- |
 | `detect-changes` | decides whether the live checks are relevant to this change | always |
-| `Backend tests (real PostgreSQL, migrations)` | migrations + `alembic check` + 117 tests against real PostgreSQL (two databases), read-only role included | always |
+| `Backend tests (real PostgreSQL, migrations)` | migrations + `alembic check` + 142 tests against real PostgreSQL (two databases), read-only role included | always |
 | `Frontend tests, typecheck and build` | `npm ci`, `tsc --noEmit`, 26 vitest tests, production build | always |
 | `Security gates (SQL validation, auth, credentials, read-only role)` | parser allowlist, auth/ownership, credential handling, CSV upload, read-only role — and fails if those tests were skipped | always |
 | `Failure-path verification (unreachable database and model)` | real error responses, no fabricated SQL/rows | live-relevant changes only |
@@ -474,8 +475,9 @@ Then, in the repository: **Settings → Actions → General** (allow Actions), a
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/health` | app + metadata database status |
-| GET | `/api/health/ai` | provider reachability and model availability |
+| GET | `/api/health` | **liveness** — process is up (never touches the database) |
+| GET | `/api/health/ready` | **readiness** — 503 while the metadata database is unreachable |
+| GET | `/api/health/ai` | real provider + model availability (cached ~15 s) |
 | POST | `/api/auth/register` · `/api/auth/login` · `/api/auth/logout` | session lifecycle (CSRF protected) |
 | GET | `/api/auth/me` | current user |
 | GET/POST | `/api/connections` | list / create connections |
@@ -519,11 +521,20 @@ Errors use a consistent envelope:
 
 Executed on 2026-10-10 on Windows with Docker Desktop (PostgreSQL 16.14), Ollama `qwen2.5-coder:7b` and the sample analytics database.
 
-Re-verified on 2026-10-11 after the CSRF/cookie hardening change: the fast backend suite reported **114 passed, 3 skipped, 3 deselected** (exit 0) — the 3 skips are the SELECT-only-role tests, which skip with an explicit reason when `QM_READONLY_*` is unset and are never counted as passes — and the frontend reported **26 passed** (5 files) with a clean `tsc --noEmit` and production build.
+Re-verified on 2026-10-11 after the CSRF/cookie hardening and production-containerisation changes:
 
 | Check | Result |
 | --- | --- |
-| Backend test suite | 120 tests: 117 fast + 3 real-model |
+| Backend fast suite (`pytest -m "not live_llm"`) | **139 passed, 3 skipped, 3 deselected** (exit 0) |
+| Backend real-model suite (`REQUIRE_LIVE_LLM=1 pytest -m live_llm`) | **3 passed** (99 s, real Ollama inference) |
+| Frontend | **26 passed** (5 files), `tsc --noEmit` clean, production build ok |
+| Container stack (production mode, same origin over HTTPS) | liveness 200, readiness 200 with `database.connected=true`, SPA root and deep link 200, HSTS + nosniff + DENY headers, `401` without a session, `403 csrf_failed` without a token, `308` HTTP→HTTPS redirect, `Secure`+`HttpOnly` session cookie, `immutable` asset caching, 6 MB upload rejected at the edge with no backend request |
+
+The 3 skips are the SELECT-only-role tests, which skip with an explicit reason when `QM_READONLY_*` is unset and are never counted as passes.
+
+| Check | Result |
+| --- | --- |
+| Backend test suite | 145 tests: 142 fast + 3 real-model |
 | Frontend tests / typecheck / build | 26 passed, typecheck clean, production build succeeds |
 | Live end-to-end (real model, real DB, two different schemas) | 46/46 checks passed |
 | Failure paths (unreachable DB / unreachable model) | 8/8 checks passed (a harness outage exits 2 as BLOCKED instead of passing) |
@@ -569,16 +580,24 @@ Two real defects were found by this verification and fixed:
 
 ---
 
-## 12. Deployment notes
+## 12. Deployment
 
-- **Frontend** — `npm run build`, deploy `frontend/dist` to Vercel or any static host; set the API base URL and keep HTTPS.
-- **Backend** — deploy the FastAPI app on a Python host (Render/Fly/container). Set `APP_ENV=production` so cookies become `Secure`, and set `FRONTEND_ORIGIN` to the deployed origin.
-- **Databases** — managed PostgreSQL with TLS (`sslmode=require`/`verify-full`), backups, and a dedicated **SELECT-only** role for analytical queries. Do not expose PostgreSQL to the internet directly.
-- **AI** — keep Ollama on a private network or use a hosted provider through the same provider abstraction; never expose an unauthenticated inference endpoint publicly.
-- **Secrets** — inject `APP_SECRET_KEY`, `ENCRYPTION_KEY`, `DATABASE_URL`, provider credentials from the platform's secret manager; never commit `.env`.
-- **Production checklist** — `ALLOW_PRIVATE_DB_HOSTS=false` with an explicit `DB_DESTINATION_ALLOWLIST`, CORS allowlist, rate limits enabled, and `/api/health` wired to your monitoring.
+The container stack lives in [docker-compose.prod.yml](docker-compose.prod.yml) and is documented step by step in **[docs/deployment.md](docs/deployment.md)** (runbook, resource sizing, migrations, backups, verification).
 
-Deployment has **not** been performed or verified as part of this work; the steps above describe what the code expects.
+```
+Browser ──HTTPS──> Caddy ──/api/*──> FastAPI ──> PostgreSQL
+                          └──/* ────> React SPA     └─> Ollama
+```
+
+- **One origin** — Caddy serves the built SPA and proxies `/api/*` to the backend, so the session cookie and CSRF double-submit token work unchanged. Do not split the SPA onto a different host without also changing the client's credentials mode.
+- **Images** — [backend/Dockerfile](backend/Dockerfile) (FastAPI + uvicorn, non-root, liveness healthcheck) and [docker/web/Dockerfile](docker/web/Dockerfile) (Vite build → Caddy runtime). Built from the repository root so [.dockerignore](.dockerignore) keeps secrets, virtualenvs and Git history out of every layer.
+- **Only Caddy is public** — PostgreSQL, Ollama and FastAPI stay on the internal network; no credential is hardcoded, required values are interpolated and fail fast when unset.
+- **Migrations are explicit** — `--profile tools run --rm migrate`; startup never alters the schema.
+- **Probes** — `/api/health` (liveness) and `/api/health/ready` (readiness, 503 on a database outage); `/api/health/ai` is diagnostics only and is cached so probes do not hammer the model.
+- **Proxy trust** — only `TRUSTED_PROXY_IPS` may set `X-Forwarded-For`; the rate limiter ignores the header from anyone else.
+- **Production checklist** — `APP_ENV=production`, `FRONTEND_ORIGIN=https://<domain>`, `ALLOW_PRIVATE_DB_HOSTS=false` (with `DB_DESTINATION_ALLOWLIST` if you want to pin hosts), real secrets from the environment/secret manager, and PostgreSQL never exposed publicly.
+
+The stack has been built and validated locally (see [docs/deployment.md](docs/deployment.md)); it has **not** been deployed to a host.
 
 ---
 

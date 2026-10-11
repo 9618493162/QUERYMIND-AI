@@ -92,10 +92,22 @@ def main() -> int:
 
     with httpx.Client(base_url=args.base_url, timeout=180.0, follow_redirects=False) as client:
         # --- 1. health -------------------------------------------------------
-        health = client.get("/api/health").json()
-        check(health.get("status") == "ok", "backend health")
+        # Liveness must answer without touching the database...
+        health_resp = client.get("/api/health")
+        health = health_resp.json()
+        check(health_resp.status_code == 200, "backend liveness")
+        check(health.get("probe") == "liveness", "liveness probe declares itself")
+        check("database" not in health, "liveness does not depend on the database")
+        # ...while readiness is the probe that reports database reachability.
+        ready_resp = client.get("/api/health/ready")
+        ready = ready_resp.json()
         check(
-            (health.get("database") or {}).get("connected") is True,
+            ready_resp.status_code == 200,
+            "readiness returns HTTP 200 with the database up",
+            f"http={ready_resp.status_code}",
+        )
+        check(
+            (ready.get("database") or {}).get("connected") is True,
             "application metadata database connected",
         )
 

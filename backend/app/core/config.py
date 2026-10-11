@@ -4,17 +4,26 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+_TLS_SSLMODES = {"require", "verify-ca", "verify-full"}
 
 
 def _is_loopback_origin(origin: str) -> bool:
     host = (urlparse(origin).hostname or "").lower()
     return host in _LOOPBACK_HOSTS
+
+
+def _database_url_parts(url: str) -> tuple[str, str]:
+    """Return (host, sslmode) parsed from a SQLAlchemy database URL."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    mode = (parse_qs(parts.query).get("sslmode") or [""])[0].lower()
+    return host, mode
 
 
 class Settings(BaseSettings):
@@ -58,6 +67,27 @@ class Settings(BaseSettings):
     auth_rate_limit_per_minute: int = 10
     query_rate_limit_per_minute: int = 30
 
+    # Metadata database connection pool. These are PER uvicorn process, so keep
+    # ``db_pool_size + db_max_overflow`` below the connection cap of a managed
+    # PostgreSQL instance (and below any pooler limit).
+    db_pool_size: int = Field(default=10, ge=1)
+    db_max_overflow: int = Field(default=10, ge=0)
+    db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=0)
+    # Require TLS for the metadata database in production. Only disable this for
+    # a database that is reachable exclusively on a private network.
+    require_db_tls: bool = True
+
+    # Reverse proxies whose ``X-Forwarded-For`` header may be believed (IPs or
+    # CIDRs, comma separated). Empty means forwarding headers are ignored.
+    trusted_proxy_ips: str = ""
+
+    # Short-lived cache for GET /api/health/ai so repeated probes do not hammer
+    # the model server. 0 disables the cache.
+    ai_health_cache_seconds: float = Field(default=15.0, ge=0)
+
+    log_level: str = "INFO"
+
     # Cookie names (public)
     session_cookie: str = "querymind_session"
     csrf_cookie: str = "querymind_csrf"
@@ -72,6 +102,16 @@ class Settings(BaseSettings):
     @classmethod
     def _warn_default_secret(cls, v: str) -> str:
         return v
+
+    @field_validator("log_level")
+    @classmethod
+    def _valid_log_level(cls, v: str) -> str:
+        level = v.upper().strip()
+        if level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+            raise ValueError(
+                "LOG_LEVEL must be one of CRITICAL, ERROR, WARNING, INFO, DEBUG"
+            )
+        return level
 
     @property
     def is_production(self) -> bool:
@@ -95,6 +135,16 @@ class Settings(BaseSettings):
     def cookies_are_secure(self) -> bool:
         """Effective Secure flag for the session and CSRF cookies."""
         return self.cookie_secure if self.cookie_secure is not None else self.is_production
+
+    @property
+    def trusted_proxies(self) -> list[str]:
+        """Reverse proxies allowed to set forwarding headers (IPs/CIDRs)."""
+        return [p.strip() for p in self.trusted_proxy_ips.split(",") if p.strip()]
+
+    @property
+    def max_db_connections(self) -> int:
+        """Upper bound of connections a single process can open."""
+        return self.db_pool_size + self.db_max_overflow
 
     def validate_production_security(self) -> list[str]:
         """Fatal problems with production cookie/CORS settings (empty when OK).
@@ -129,6 +179,16 @@ class Settings(BaseSettings):
             )
         if self.cookie_samesite == "none" and not self.cookies_are_secure:
             problems.append("COOKIE_SAMESITE=none requires Secure cookies.")
+        # The metadata database carries credentials and user data: require TLS
+        # unless it is explicitly documented as private-network only.
+        if self.require_db_tls:
+            host, sslmode = _database_url_parts(self.database_url)
+            if host and host not in _LOOPBACK_HOSTS and sslmode not in _TLS_SSLMODES:
+                problems.append(
+                    "DATABASE_URL must require TLS in production (append ?sslmode=require), "
+                    "or set REQUIRE_DB_TLS=false when the database is only reachable on a "
+                    "private network."
+                )
         return problems
 
     def validate_for_runtime(self) -> list[str]:

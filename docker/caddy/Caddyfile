@@ -1,0 +1,68 @@
+# QueryMind AI — production reverse proxy and static host.
+#
+#   Browser ──HTTPS──> Caddy ──/api/*──> FastAPI (backend:8001)
+#                            └──/* ────> React SPA (/srv with history fallback)
+#
+# Serving the SPA and the API from ONE origin is what keeps the session cookie
+# and the CSRF double-submit token working: the browser client uses
+# `credentials: 'same-origin'` and relative `/api/...` paths.
+#
+# Environment (supplied by docker-compose.prod.yml):
+#   SITE_ADDRESS       public hostname (or :80 for a local HTTP smoke test)
+#   ACME_EMAIL         contact address for the Let's Encrypt account
+#   BACKEND_UPSTREAM   backend address, default backend:8001
+#
+# Caddy obtains and renews the TLS certificate automatically and redirects
+# HTTP to HTTPS once SITE_ADDRESS is a real DNS name.
+
+{
+	email {$ACME_EMAIL}
+	# Admin API stays on loopback; the container healthcheck uses it.
+	admin localhost:2019
+}
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# The application caps uploads at 5 MB; enforce it at the edge as well so an
+	# oversized body is rejected before it reaches Python.
+	request_body {
+		max_size 6MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	# Vite emits content-hashed filenames under /assets: safe to cache forever.
+	@assets path /assets/*
+	handle @assets {
+		root * /srv
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# API, health and docs-free backend routes.
+	handle /api/* {
+		reverse_proxy {$BACKEND_UPSTREAM:backend:8001}
+	}
+
+	# Everything else is the single-page application. try_files gives the
+	# client-side router its history fallback (deep links resolve to index.html).
+	handle {
+		root * /srv
+		header Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output stderr
+		format json
+	}
+}

@@ -106,6 +106,10 @@ def _clean_tables():
     with engine.begin() as conn:
         conn.exec_driver_sql(f"TRUNCATE {table_names} CASCADE")
     rate_limit.reset()
+    # Provider status is cached per process; never let one test see another's.
+    from app.api import health as health_module
+
+    health_module.reset_ai_status_cache()
     yield
 
 

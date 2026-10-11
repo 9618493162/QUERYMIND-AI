@@ -101,3 +101,71 @@ def test_upload_requires_authentication(client: TestClient):
     # CSRF dependency runs first for cookie-less clients (403); browser clients
     # with a CSRF cookie but no session get 401.
     assert resp.status_code in (401, 403)
+
+
+def _oversized_csv() -> bytes:
+    """Build a CSV comfortably past MAX_UPLOAD_BYTES (4 bytes per row)."""
+    payload = b"a,b\n" + b"1,2\n" * 1_600_000  # ~6.4 MB
+    assert len(payload) > csv_service.MAX_UPLOAD_BYTES
+    return payload
+
+
+def test_oversized_upload_is_rejected_while_streaming(auth_client: TestClient):
+    """The 5 MB cap is enforced at the edge of the request, not after buffering.
+
+    /api/uploads is deliberately exempt from the generic 2 MB body cap, so this
+    is the check that actually protects the server from a huge upload.
+    """
+    oversized = _oversized_csv()
+
+    resp = auth_client.post(
+        "/api/uploads/preview",
+        headers=csrf(auth_client),
+        files={"file": ("huge.csv", oversized, "text/csv")},
+    )
+
+    assert resp.status_code == 413
+    body = resp.json()
+    assert body["error"]["code"] == "file_too_large"
+    assert "5 MB" in body["error"]["message"]
+
+
+def test_oversized_dataset_creation_is_rejected(auth_client: TestClient, analytics_connection_payload: dict):
+    create = auth_client.post(
+        "/api/connections", headers=csrf(auth_client), json=analytics_connection_payload
+    )
+    conn_id = create.json()["connection"]["id"]
+
+    oversized = _oversized_csv()
+    resp = auth_client.post(
+        "/api/uploads",
+        headers=csrf(auth_client),
+        data={"connection_id": conn_id, "table_name": "too_big", "persistent": "false"},
+        files={"file": ("huge.csv", oversized, "text/csv")},
+    )
+
+    assert resp.status_code == 413
+    assert resp.json()["error"]["code"] == "file_too_large"
+
+
+def test_upload_at_the_limit_is_accepted(client: TestClient):
+    """A file exactly at the cap must pass (the boundary is not off by one)."""
+    from app.api.uploads import read_upload_limited
+
+    payload = b"a,b\n" + b"1,2\n" * ((csv_service.MAX_UPLOAD_BYTES - 4) // 4)
+    payload = payload[: csv_service.MAX_UPLOAD_BYTES]
+    assert len(payload) == csv_service.MAX_UPLOAD_BYTES
+
+    class ExactUpload:
+        def __init__(self) -> None:
+            self._sent = False
+
+        async def read(self, size: int = -1) -> bytes:
+            if self._sent:
+                return b""
+            self._sent = True
+            return payload
+
+    import asyncio
+
+    assert asyncio.run(read_upload_limited(ExactUpload())) == payload

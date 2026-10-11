@@ -14,7 +14,7 @@ not a dependency.
 | Algorithm | Fixed window, one minute per key |
 | Storage | In-process Python `dict` (`defaultdict(list)` of timestamps) |
 | Key | `"{bucket}:{client_key}"` |
-| Client key | First entry of `X-Forwarded-For`, else the direct peer IP |
+| Client key | Direct peer IP; `X-Forwarded-For` is used only when the peer is a configured trusted proxy |
 | Limit exceeded | `429` with `{"error": {"code": "rate_limited"}}` |
 | Synchronisation | A module-level `threading.Lock` around the counter |
 
@@ -48,9 +48,11 @@ These are properties of the current implementation, not bugs:
    with the number of distinct client keys seen since start. Under high
    cardinality or spoofed `X-Forwarded-For` values, memory grows until the
    process restarts.
-5. **`X-Forwarded-For` is trusted.** The client key comes from that header when
-   present, so a client that can set it can also rotate its bucket key. Only run
-   behind a proxy that overwrites/validates the header.
+5. **Forwarding headers need a trusted proxy.** With `TRUSTED_PROXY_IPS` unset
+   the header is ignored and the direct peer address is used. Behind a proxy the
+   chain is walked right-to-left (skipping trusted hops) and the first untrusted
+   address wins, so a client that prepends a fake address cannot rotate its
+   bucket — but the proxy address itself must be configured correctly.
 6. **Fixed window, not sliding.** A client can burst twice at a window boundary
    (up to `2 × limit` in a short period).
 

@@ -17,12 +17,16 @@ _SessionLocal: sessionmaker[Session] | None = None
 def get_engine() -> Engine:
     global _engine, _SessionLocal
     if _engine is None:
+        # Pool sizing is configurable because it is per process: a managed
+        # PostgreSQL instance (or a pooler in front of it) caps total
+        # connections, so several uvicorn workers multiply this budget.
         _engine = create_engine(
             settings.database_url,
             pool_pre_ping=True,
-            pool_size=10,
-            max_overflow=10,
-            pool_recycle=1800,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout_seconds,
+            pool_recycle=settings.db_pool_recycle_seconds,
             future=True,
         )
         _SessionLocal = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False, future=True)

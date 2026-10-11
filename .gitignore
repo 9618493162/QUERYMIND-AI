@@ -9,6 +9,10 @@ venv/
 # Env / secrets
 .env
 .env.local
+# Production secrets live in .env.production and must never be committed.
+.env.production
+.env.production.*
+!.env.production.example
 *.pem
 *.key
 

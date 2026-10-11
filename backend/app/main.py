@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -33,12 +35,15 @@ from app.core.errors import (
 )
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("querymind")
 
-MAX_BODY_BYTES = 2_000_000  # 2 MB request cap (CSV uploads use their own route limits)
+MAX_BODY_BYTES = 2_000_000  # 2 MB request cap (CSV uploads enforce their own 5 MB streaming limit)
+
+# Correlation id accepted from a caller only when it looks like an id.
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 @asynccontextmanager
@@ -62,6 +67,16 @@ async def lifespan(_app: FastAPI):
         logger.error("Metadata database unreachable: %s", exc.__class__.__name__)
         if settings.is_production:
             raise
+    # Operational summary (no secrets): what the app will trust at runtime.
+    logger.info(
+        "Runtime configuration: environment=%s origins=%s trusted_proxies=%s "
+        "max_db_connections=%s cookies_secure=%s",
+        settings.app_env,
+        settings.cors_origins,
+        settings.trusted_proxies or "none (X-Forwarded-For will be ignored)",
+        settings.max_db_connections,
+        settings.cookies_are_secure,
+    )
     yield
 
 
@@ -118,6 +133,21 @@ def create_app() -> FastAPI:
                         },
                     )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        """Attach a correlation id so log lines and errors can be traced.
+
+        A caller-supplied ``X-Request-ID`` is reused only when it looks like an
+        id; anything else is replaced, so it can never be used to inject data
+        into logs.
+        """
+        incoming = request.headers.get("x-request-id") or ""
+        request_id = incoming if _REQUEST_ID_RE.match(incoming) else uuid.uuid4().hex
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
