@@ -19,6 +19,11 @@ on:
     branches: [main, master]
   push:
     branches: [main, master]
+  schedule:
+    # Nightly full verification, 00:00 UTC (GitHub Actions cron is UTC and the
+    # workflow must live on the default branch). Scheduled runs must never skip
+    # the live checks: detect-live-required.sh forces live=true for schedule.
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       live:

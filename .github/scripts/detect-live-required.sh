@@ -86,6 +86,11 @@ push)
         decide_from_range "${BEFORE}..${SHA}" "push event"
     fi
     ;;
+schedule)
+    # Nightly runs exist to catch drift (model, runner image, dependencies),
+    # so they always take the expensive path regardless of the last diff.
+    emit true "scheduled run — live verification is always required"
+    ;;
 *)
     # workflow_dispatch and unknown events: gate on the latest commit so an
     # explicit run with live=auto still spends the model only when needed.

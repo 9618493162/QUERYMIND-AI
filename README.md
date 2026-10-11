@@ -333,7 +333,7 @@ The pipeline lives in [.github/workflows/ci.yml](.github/workflows/ci.yml) with 
 | `Live verification (real Ollama model, real database)` | real inference, `pytest -m live_llm`, `scripts/live_e2e_check.py` | live-relevant changes only |
 | `Verification summary` | one PASSED/FAILED/NOT RUN table, fails if any required job failed | always |
 
-**Triggers** — pull requests and pushes to `main`/`master`, plus `workflow_dispatch` with a `live` input (`auto` | `always` | `never`).
+**Triggers** — pull requests and pushes to `main`/`master`, `workflow_dispatch` with a `live` input (`auto` | `always` | `never`), and a nightly `schedule` (`cron: "0 0 * * *"`, i.e. 00:00 UTC). Scheduled runs execute all seven jobs: the change gate emits `live=true` unconditionally for the `schedule` event, so the live model checks are never skipped by change detection.
 
 The workflow uses only first-party actions (`actions/checkout`, `setup-python`, `setup-node`, `cache`, `upload-artifact`) with `permissions: contents: read`. If your security policy requires immutable references, replace each `@vN` with the reviewed commit SHA (and add Dependabot or Renovate to keep them current) — the change is mechanical and does not alter any command in this workflow.
 
@@ -466,7 +466,7 @@ Then, in the repository: **Settings → Actions → General** (allow Actions), a
 
 - **Validated locally:** workflow YAML parses; `actionlint` (v1.7.7) reports **no findings** including shellcheck on every `run:` block; the change-detection helper was exercised against real git histories; `docker compose up -d --wait` returns 0 with both databases healthy; `npm ci --dry-run` shows the lockfile is in sync; `alembic upgrade head` + `alembic check` report no drift; the security skip-gate passes when the read-only role exists and **fails** when it does not; `ollama list` parsing finds `qwen2.5-coder:7b`; `REQUIRE_LIVE_LLM` was proven to fail (not skip) with the model unreachable; and the summary script extracted from the workflow was executed against three synthetic job graphs — green with live checks not required (exit 0, `NOT RUN`), a fast-test regression (exit 1, `FAILED`), and an infrastructure outage (exit 1, `BLOCKED BY CI INFRASTRUCTURE (not a pass)`).
 - **Validated on a real GitHub Actions run:** run #2 on `d53a9a5` (https://github.com/9618493162/QUERYMIND-AI/actions/runs/38115130251) completed with **all 7 jobs green**, including the pieces that only exist on Linux runners: Ollama install, model cache, 7B model pull, real inference, `pytest -m live_llm` with `REQUIRE_LIVE_LLM=1`, the live E2E script, and the failure-path script. Run #1 failed in `Detect changed areas` because the gate script's interface had drifted from what `ci.yml` invokes; the contract was restored and the decision matrix re-verified locally before run #2.
-- **Still to validate:** branch protection with the five required checks (repository settings), and any scheduled run — neither exists yet.
+- **Still to validate:** branch protection with the five required checks (repository settings). The nightly `schedule` trigger (`0 0 * * *` UTC) is configured and its gate path is covered by the local decision matrix, but the cron has not fired yet — the first actual scheduled run is the remaining remote validation.
 
 ## 9. API
 
