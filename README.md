@@ -454,12 +454,9 @@ Points that matter:
 
 ### Enabling it on GitHub
 
+This checkout is connected to `https://github.com/9618493162/QUERYMIND-AI` (verify with `git remote -v`); pushing `main` triggers the workflow:
+
 ```bash
-# this workspace is not a git repository yet — initialise and push it
-git init -b main
-git add .
-git commit -m "Add QueryMind AI"        # .gitattributes keeps scripts LF for Linux runners
-git remote add origin git@github.com:<owner>/<repo>.git
 git push -u origin main
 ```
 
@@ -468,7 +465,8 @@ Then, in the repository: **Settings → Actions → General** (allow Actions), a
 ### Verification status of this pipeline
 
 - **Validated locally:** workflow YAML parses; `actionlint` (v1.7.7) reports **no findings** including shellcheck on every `run:` block; the change-detection helper was exercised against real git histories; `docker compose up -d --wait` returns 0 with both databases healthy; `npm ci --dry-run` shows the lockfile is in sync; `alembic upgrade head` + `alembic check` report no drift; the security skip-gate passes when the read-only role exists and **fails** when it does not; `ollama list` parsing finds `qwen2.5-coder:7b`; `REQUIRE_LIVE_LLM` was proven to fail (not skip) with the model unreachable; and the summary script extracted from the workflow was executed against three synthetic job graphs — green with live checks not required (exit 0, `NOT RUN`), a fast-test regression (exit 1, `FAILED`), and an infrastructure outage (exit 1, `BLOCKED BY CI INFRASTRUCTURE (not a pass)`).
-- **Not yet validated remotely:** this environment has no GitHub repository, so **no GitHub Actions run has been executed**. The Ollama install/cache steps in particular only exist on Linux runners and have not been executed anywhere. Treat the first `workflow_dispatch` run as the real validation.
+- **Validated on a real GitHub Actions run:** run #2 on `d53a9a5` (https://github.com/9618493162/QUERYMIND-AI/actions/runs/38115130251) completed with **all 7 jobs green**, including the pieces that only exist on Linux runners: Ollama install, model cache, 7B model pull, real inference, `pytest -m live_llm` with `REQUIRE_LIVE_LLM=1`, the live E2E script, and the failure-path script. Run #1 failed in `Detect changed areas` because the gate script's interface had drifted from what `ci.yml` invokes; the contract was restored and the decision matrix re-verified locally before run #2.
+- **Still to validate:** branch protection with the five required checks (repository settings), and any scheduled run — neither exists yet.
 
 ## 9. API
 
