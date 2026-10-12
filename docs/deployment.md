@@ -40,6 +40,11 @@ practical minimum and only if the model runs alone. CPU inference of a 7B model
 takes seconds per generated query; `AI_TIMEOUT_SECONDS=180` is set for that
 reason. No GPU is required.
 
+With `AI_PROVIDER=nvidia` (see [section 12](#12-ai-provider-ollama-or-nvidia-nim))
+inference runs on NVIDIA's hosted endpoint instead: the 8 GB RAM / 5 GB disk for
+the local model are not needed, and the backend only needs outbound HTTPS to
+`integrate.api.nvidia.com`.
+
 ## 2. Prerequisites
 
 1. A host with Docker Engine and Compose v2 (`docker compose version`).
@@ -192,3 +197,31 @@ Also confirm, in a browser: the session cookie is `Secure` + `HttpOnly`,
   `pytest`/`pytest-asyncio`; splitting test dependencies is a follow-up.
 - HTTPS/ACME assumes Caddy can complete the HTTP-01 challenge (port 80 open, DNS
   resolving); a DNS-01 setup is out of scope.
+
+## 12. AI provider: Ollama or NVIDIA NIM
+
+The default provider is local Ollama. To use NVIDIA's hosted, OpenAI-compatible
+NIM endpoint instead (for example on a host without room for an 8 GB model), set
+these in `.env.production`:
+
+| Variable | Purpose |
+| --- | --- |
+| `AI_PROVIDER=nvidia` | switch the backend to the NVIDIA provider |
+| `NVIDIA_API_KEY` | your NIM API key from https://build.nvidia.com — **required, never commit it** |
+| `NVIDIA_BASE_URL` | endpoint; defaults to `https://integrate.api.nvidia.com/v1` |
+| `NVIDIA_MODEL` | the exact model ID to use — nothing is assumed if it is unset |
+
+Operational notes:
+
+- Startup validation refuses to boot with `AI_PROVIDER=nvidia` and a missing key
+  or model, so a misconfigured deployment fails fast instead of erroring on
+  every query.
+- The key is sent only in the `Authorization: Bearer` header and is redacted from
+  every error, status message and log line; `/api/health/ai` never returns it.
+- The variables flow through the existing `env_file: .env.production` entry of
+  the backend service — no compose change is required.
+- The `ollama` service still starts (the backend declares it as a dependency)
+  but is unused, and the model pull in section 3 can be skipped.
+- The backend needs outbound access to `integrate.api.nvidia.com:443`; nothing
+  additional is opened in Caddy. On Render/Vercel-style hosting the same four
+  variables are set in the backend service's environment.

@@ -111,8 +111,13 @@ def test_ai_health_matches_the_real_provider(client: TestClient):
 
     body = client.get("/api/health/ai").json()
 
+    expected_model = (
+        settings.nvidia_model
+        if settings.ai_provider.lower().strip() == "nvidia"
+        else settings.ollama_model
+    )
     assert body["provider"] == settings.ai_provider
-    assert body["model"] == settings.ollama_model
+    assert body["model"] == expected_model
     assert body["status"] in {"ok", "unavailable"}
     assert isinstance(body["models"], list)
     if body["status"] == "unavailable":
