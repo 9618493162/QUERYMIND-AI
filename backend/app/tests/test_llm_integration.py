@@ -41,8 +41,10 @@ def _create_connection(client: TestClient, payload: dict) -> str:
 
 
 def test_ai_provider_reports_real_status():
+    from app.core.config import settings
+
     status = _ai_status()
-    assert status.provider == "ollama"
+    assert status.provider == settings.ai_provider.lower().strip()
     # The endpoint must report truthfully either way.
     assert isinstance(status.available, bool)
     assert status.message

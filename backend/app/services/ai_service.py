@@ -1,11 +1,12 @@
 """Real LLM integration.
 
 Provider abstraction so the model backend can be swapped without touching the
-SQL execution engine. The default provider is Ollama (local inference).
+SQL execution engine. Supported providers: Ollama (local inference, the
+default) and NVIDIA NIM (hosted, OpenAI-compatible chat completions API).
 
 Nothing here ever fabricates a model response: if the provider is unreachable,
 times out, or returns malformed output, a clear error is raised and surfaced to
-the user.
+the user. API keys are never included in errors, status messages or logs.
 """
 
 from __future__ import annotations
@@ -165,6 +166,271 @@ class OllamaProvider:
         )
 
 
+class NVIDIAProvider:
+    """NVIDIA NIM via its OpenAI-compatible ``/chat/completions`` endpoint."""
+
+    name = "nvidia"
+    # Status probes are diagnostics, not inference: keep them snappy even when
+    # the inference timeout is generous for slow CPU/GPU generation.
+    STATUS_TIMEOUT_SECONDS = 10.0
+    STATUS_MODEL_SAMPLE = 10
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float,
+        max_retries: int,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._transport = transport
+
+    def _client(self, timeout: float | None = None) -> httpx.Client:
+        return httpx.Client(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(self.timeout if timeout is None else timeout),
+            transport=self._transport,
+        )
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _redact(self, text: str) -> str:
+        """Defense in depth: never let the API key leak into errors or logs."""
+        if self.api_key and self.api_key in text:
+            return text.replace(self.api_key, "***")
+        return text
+
+    @staticmethod
+    def _error_detail(resp: httpx.Response) -> str:
+        """Pull a human-readable message out of an OpenAI-style error body."""
+        try:
+            body = resp.json()
+        except Exception:
+            return resp.text[:200]
+        if isinstance(body, dict):
+            err = body.get("error", body)
+            if isinstance(err, dict):
+                err = err.get("message", err)
+            if isinstance(err, str) and err:
+                return err[:300]
+            return str(err)[:300] if err else resp.text[:200]
+        return str(body)[:200]
+
+    def status(self) -> AIStatus:
+        """Lightweight, safe provider check: authenticated GET /models.
+
+        The response and every message are scrubbed so the API key can never be
+        exposed, and the probe uses a short timeout so health checks stay fast.
+        """
+        if not self.api_key:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=(
+                    "NVIDIA_API_KEY is not set. Set it to a NVIDIA NIM API key "
+                    "(https://build.nvidia.com) to use the NVIDIA provider."
+                ),
+            )
+        if not self.model:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=(
+                    "NVIDIA_MODEL is not set. Set it to the model ID you want to use; "
+                    "the available IDs are listed at https://build.nvidia.com."
+                ),
+            )
+
+        started = time.monotonic()
+        try:
+            with self._client(timeout=min(self.timeout, self.STATUS_TIMEOUT_SECONDS)) as client:
+                resp = client.get("/models", headers=self._headers)
+        except httpx.TimeoutException:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=(
+                    f"The NVIDIA API at {self.base_url} did not answer within "
+                    f"{self.STATUS_TIMEOUT_SECONDS:.0f}s."
+                ),
+            )
+        except httpx.HTTPError as exc:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=self._redact(
+                    f"Cannot reach the NVIDIA API at {self.base_url} "
+                    f"({exc.__class__.__name__})."
+                ),
+            )
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if resp.status_code in (401, 403):
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=self._redact(
+                    f"The NVIDIA API rejected the credential (HTTP {resp.status_code}). "
+                    "Check NVIDIA_API_KEY."
+                ),
+                latency_ms=latency_ms,
+            )
+        if resp.status_code >= 400:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=self._redact(
+                    f"The NVIDIA API at {self.base_url} returned HTTP {resp.status_code}: "
+                    f"{self._error_detail(resp)}"
+                ),
+                latency_ms=latency_ms,
+            )
+
+        try:
+            data = resp.json()
+            models = [
+                m.get("id", "")
+                for m in data.get("data", [])
+                if isinstance(m, dict) and m.get("id")
+            ]
+        except Exception:
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message="The NVIDIA API returned a malformed response body.",
+                latency_ms=latency_ms,
+            )
+
+        if self.model not in models:
+            sample = ", ".join(models[: self.STATUS_MODEL_SAMPLE]) or "none listed"
+            return AIStatus(
+                available=False,
+                provider=self.name,
+                model=self.model,
+                message=(
+                    f"Model '{self.model}' was not found in the NVIDIA model list. "
+                    f"Set NVIDIA_MODEL to one of the available IDs, for example: {sample}."
+                ),
+                models=models,
+                latency_ms=latency_ms,
+            )
+        return AIStatus(
+            available=True,
+            provider=self.name,
+            model=self.model,
+            message="The NVIDIA API is reachable and the configured model is available.",
+            models=models,
+            latency_ms=latency_ms,
+        )
+
+    def complete(self, messages: list[dict[str, str]], *, json_mode: bool = True) -> str:
+        if not self.api_key:
+            raise AIProviderError(
+                "provider_unavailable",
+                "NVIDIA_API_KEY is not set; the NVIDIA AI provider cannot be used.",
+            )
+        if not self.model:
+            raise AIProviderError(
+                "model_missing",
+                "NVIDIA_MODEL is not set. Set it to the model ID to use.",
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        last_error: str | None = None
+        with self._client() as client:
+            attempt = 0
+            while attempt <= self.max_retries:
+                try:
+                    resp = client.post("/chat/completions", json=payload, headers=self._headers)
+                except httpx.TimeoutException:
+                    last_error = (
+                        f"The model did not respond within {self.timeout:.0f}s. "
+                        "Check the provider performance or choose a faster model."
+                    )
+                    attempt += 1
+                    continue
+                except httpx.HTTPError as exc:
+                    last_error = f"Could not reach the AI provider: {exc.__class__.__name__}."
+                    attempt += 1
+                    continue
+
+                if resp.status_code >= 500:
+                    last_error = f"AI provider returned HTTP {resp.status_code}."
+                    attempt += 1
+                    continue
+                if resp.status_code >= 400:
+                    detail = self._error_detail(resp)
+                    # Some OpenAI-compatible endpoints reject response_format;
+                    # retry once without it (bounded: payload no longer carries
+                    # the key, so this branch cannot fire again).
+                    if (
+                        resp.status_code == 400
+                        and "response_format" in payload
+                        and "response_format" in detail.lower()
+                    ):
+                        payload.pop("response_format", None)
+                        last_error = self._redact(
+                            f"The AI provider rejected response_format (HTTP 400): {detail}."
+                        )
+                        continue
+                    if resp.status_code in (401, 403):
+                        raise AIProviderError(
+                            "provider_error",
+                            self._redact(
+                                f"The AI provider rejected the credential (HTTP "
+                                f"{resp.status_code}). Check NVIDIA_API_KEY."
+                            ),
+                        )
+                    raise AIProviderError(
+                        "provider_error",
+                        self._redact(
+                            f"The AI provider rejected the request: {detail or resp.status_code}."
+                        ),
+                    )
+                try:
+                    data = resp.json()
+                    choices = data.get("choices")
+                    content = choices[0].get("message", {}).get("content", "") if choices else ""
+                except Exception:
+                    content = ""
+                    last_error = "The AI provider returned a malformed response body."
+                    attempt += 1
+                    continue
+                if not isinstance(content, str) or not content:
+                    last_error = "The AI model returned an empty response."
+                    attempt += 1
+                    continue
+                return content
+
+        raise AIProviderError(
+            "provider_unavailable",
+            last_error or "The AI provider is unavailable after multiple attempts.",
+        )
+
+
 def build_provider() -> AIProvider:
     provider = settings.ai_provider.lower().strip()
     if provider == "ollama":
@@ -174,10 +440,18 @@ def build_provider() -> AIProvider:
             timeout=settings.ai_timeout_seconds,
             max_retries=settings.ai_max_retries,
         )
+    if provider == "nvidia":
+        return NVIDIAProvider(
+            base_url=settings.nvidia_base_url,
+            api_key=settings.nvidia_api_key,
+            model=settings.nvidia_model,
+            timeout=settings.ai_timeout_seconds,
+            max_retries=settings.ai_max_retries,
+        )
     raise ApiError(
         503,
         "unsupported_provider",
-        f"AI provider '{settings.ai_provider}' is not supported yet. Supported: ollama.",
+        f"AI provider '{settings.ai_provider}' is not supported yet. Supported: ollama, nvidia.",
     )
 
 

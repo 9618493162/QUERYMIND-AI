@@ -41,10 +41,15 @@ class Settings(BaseSettings):
         "postgresql+psycopg://app_user:app_password_change_me@localhost:5432/querymind"
     )
 
-    # AI provider
+    # AI provider ("ollama" or "nvidia")
     ai_provider: str = "ollama"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:7b"
+    # NVIDIA NIM (OpenAI-compatible chat completions API). The model ID is
+    # always taken from NVIDIA_MODEL — no model ID is assumed anywhere.
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_model: str = ""
     ai_timeout_seconds: float = 60.0
     ai_max_retries: int = 2
 
@@ -208,6 +213,13 @@ class Settings(BaseSettings):
                 "ENCRYPTION_KEY is not set. Generate one with: "
                 'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
             )
+        # A selected provider must be fully configured: an NVIDIA deployment
+        # without its credential/model would fail every request at runtime.
+        if self.ai_provider.lower().strip() == "nvidia":
+            if not self.nvidia_api_key:
+                problems.append("NVIDIA_API_KEY must be set when AI_PROVIDER=nvidia.")
+            if not self.nvidia_model:
+                problems.append("NVIDIA_MODEL must be set when AI_PROVIDER=nvidia.")
         # Cookie + CORS settings that must be safe in production.
         problems.extend(self.validate_production_security())
         return problems

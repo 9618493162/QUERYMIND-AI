@@ -175,7 +175,8 @@ Mandatory values:
 | `APP_ENV` | `development` or `production` (production enables Secure cookies) |
 | `APP_SECRET_KEY` | session/CSRF signing secret — `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `DATABASE_URL` | application metadata database |
-| `AI_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | real model provider and model name |
+| `AI_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | real model provider (`ollama`, default) and model name |
+| `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`, `NVIDIA_MODEL` | NVIDIA NIM provider — required when `AI_PROVIDER=nvidia`; the model ID comes from `NVIDIA_MODEL` and is never assumed |
 | `ENCRYPTION_KEY` | **required** to save connections — `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `FRONTEND_ORIGIN` | CORS/cookie origin(s), e.g. `http://localhost:5173` (comma-separate several) |
 
@@ -205,6 +206,23 @@ Set `OLLAMA_MODEL` to whatever `ollama list` shows. Check availability through t
 ```bash
 curl http://127.0.0.1:8001/api/health/ai
 ```
+
+### 5.4 Alternative: NVIDIA NIM (hosted)
+
+To run inference on NVIDIA's OpenAI-compatible endpoint instead of local Ollama:
+
+```bash
+AI_PROVIDER=nvidia
+NVIDIA_API_KEY=...          # from https://build.nvidia.com (keep it secret)
+NVIDIA_MODEL=...            # the exact model ID to use; nothing is assumed
+# NVIDIA_BASE_URL defaults to https://integrate.api.nvidia.com/v1
+```
+
+Startup validation refuses to boot when `AI_PROVIDER=nvidia` and `NVIDIA_API_KEY`
+or `NVIDIA_MODEL` is missing, so misconfiguration fails fast instead of erroring
+on every query. The key is sent only as a `Bearer` token and is redacted from
+errors, `/api/health/ai` status output and logs. The same check works:
+`curl http://127.0.0.1:8001/api/health/ai`.
 
 ---
 
