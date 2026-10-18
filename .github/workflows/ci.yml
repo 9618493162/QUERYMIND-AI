@@ -172,6 +172,8 @@ jobs:
 
       - name: Run backend test suite
         working-directory: backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
           mkdir -p ../reports
@@ -282,6 +284,8 @@ jobs:
 
       - name: Run security test suites
         working-directory: backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
           mkdir -p ../reports
@@ -558,6 +562,7 @@ jobs:
         working-directory: backend
         env:
           REQUIRE_LIVE_LLM: "1"
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           set -o pipefail
           mkdir -p ../reports
