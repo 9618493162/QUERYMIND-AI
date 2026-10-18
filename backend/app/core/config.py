@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import parse_qs, urlparse, urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
@@ -26,6 +26,27 @@ def _database_url_parts(url: str) -> tuple[str, str]:
     return host, mode
 
 
+def normalize_database_url(url: str) -> str:
+    """Point a bare PostgreSQL URL at the driver this project actually ships.
+
+    The application (and Alembic) only install psycopg 3, so:
+
+    * ``postgres://`` — the scheme some managed dashboards hand out — is not a
+      SQLAlchemy 2 dialect at all and fails at connect time;
+    * ``postgresql://`` defaults to psycopg 2, which is not installed.
+
+    Everything else, including the query string that carries ``sslmode`` and
+    any other TLS settings, is passed through untouched: the effective URL must
+    stay byte-for-byte the value the operator configured, only with the right
+    driver in front of it.
+    """
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://") :]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -40,6 +61,38 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+psycopg://app_user:app_password_change_me@localhost:5432/querymind"
     )
+
+    # Apply pending Alembic migrations during application startup, before the
+    # server accepts its first request. Production fails closed: if the
+    # migration cannot run, the process refuses to serve traffic instead of
+    # answering with "relation ... does not exist".
+    #
+    # The flag applies in every environment. Turning it off opts into a
+    # strictly release-driven deploy: `python -m alembic upgrade head` (or the
+    # compose `migrate` tool) MUST run before the first deployment, or a fresh
+    # database will reject registration. That is why the operator gets a loud
+    # warning at configuration time.
+    run_migrations_on_startup: bool = True
+
+    @field_validator("run_migrations_on_startup", mode="after")
+    @classmethod
+    def _warn_when_startup_migrations_are_disabled(
+        cls, v: bool, info: ValidationInfo
+    ) -> bool:
+        # Only production is warned about: test suites and local development
+        # legitimately disable startup migrations (they manage the schema
+        # themselves and the flag would race the fixture setup).
+        if v is False and info.data.get("app_env") == "production":
+            import warnings
+
+            warnings.warn(
+                "RUN_MIGRATIONS_ON_STARTUP=false: startup migrations are OFF. "
+                "Run `python -m alembic upgrade head` in the release step before "
+                "serving traffic, or a fresh database will fail registration "
+                "with `relation \"users\" does not exist`.",
+                stacklevel=2,
+            )
+        return v
 
     # AI provider ("ollama" or "nvidia")
     ai_provider: str = "ollama"
@@ -135,6 +188,16 @@ class Settings(BaseSettings):
         and ``https://app.example.com`` are treated as the same origin.
         """
         return [o.strip().rstrip("/") for o in self.frontend_origin.split(",") if o.strip()]
+
+    @property
+    def effective_database_url(self) -> str:
+        """The URL every component connects with: one source of truth.
+
+        Used by the application engine AND by Alembic, so the migration and the
+        running server can never disagree about driver, host, credentials or
+        TLS (``sslmode=...``) settings.
+        """
+        return normalize_database_url(self.database_url)
 
     @property
     def cookies_are_secure(self) -> bool:

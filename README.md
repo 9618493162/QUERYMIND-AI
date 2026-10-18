@@ -188,10 +188,16 @@ The application refuses to store connections when `ENCRYPTION_KEY` is missing, i
 
 ### 5.2 Migrations
 
+Pending migrations are applied **during startup, before the API serves its first request**: the FastAPI lifespan calls [backend/app/db/migrate.py](backend/app/db/migrate.py), which runs `alembic upgrade head`. In production a failed migration stops the process (fail-closed) instead of serving `relation ... does not exist` errors; concurrent starts queue on a PostgreSQL advisory lock; only `upgrade` is ever run — never `downgrade` or a drop. Alembic reads the same effective `DATABASE_URL` as the application (psycopg driver, `sslmode` and every other query parameter preserved).
+
+To apply them explicitly instead (release step, deploy runbook):
+
 ```bash
 cd backend
-./.venv/Scripts/alembic upgrade head
+./.venv/Scripts/alembic upgrade head        # or: python -m app.db.migrate
 ```
+
+Set `RUN_MIGRATIONS_ON_STARTUP=false` to disable the automatic step and keep migrations strictly release-driven.
 
 ### 5.3 AI model setup
 
@@ -610,7 +616,7 @@ Browser ──HTTPS──> Caddy ──/api/*──> FastAPI ──> PostgreSQL
 - **One origin** — Caddy serves the built SPA and proxies `/api/*` to the backend, so the session cookie and CSRF double-submit token work unchanged. Do not split the SPA onto a different host without also changing the client's credentials mode.
 - **Images** — [backend/Dockerfile](backend/Dockerfile) (FastAPI + uvicorn, non-root, liveness healthcheck) and [docker/web/Dockerfile](docker/web/Dockerfile) (Vite build → Caddy runtime). Built from the repository root so [.dockerignore](.dockerignore) keeps secrets, virtualenvs and Git history out of every layer.
 - **Only Caddy is public** — PostgreSQL, Ollama and FastAPI stay on the internal network; no credential is hardcoded, required values are interpolated and fail fast when unset.
-- **Migrations are explicit** — `--profile tools run --rm migrate`; startup never alters the schema.
+- **Migrations** — applied automatically during startup, before the API serves traffic (fail-closed in production; `RUN_MIGRATIONS_ON_STARTUP=false` opts out). The explicit release step remains available: `--profile tools run --rm migrate`.
 - **Probes** — `/api/health` (liveness) and `/api/health/ready` (readiness, 503 on a database outage); `/api/health/ai` is diagnostics only and is cached so probes do not hammer the model.
 - **Proxy trust** — only `TRUSTED_PROXY_IPS` may set `X-Forwarded-For`; the rate limiter ignores the header from anyone else.
 - **Production checklist** — `APP_ENV=production`, `FRONTEND_ORIGIN=https://<domain>`, `ALLOW_PRIVATE_DB_HOSTS=false` (with `DB_DESTINATION_ALLOWLIST` if you want to pin hosts), real secrets from the environment/secret manager, and PostgreSQL never exposed publicly.
