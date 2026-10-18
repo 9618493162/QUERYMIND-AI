@@ -112,11 +112,25 @@ export default function Dashboard() {
             <div className="mt-3 space-y-1 text-sm text-slate-600 dark:text-slate-400">
               <p>
                 <span className="font-medium text-slate-800 dark:text-slate-200">Provider:</span>{' '}
-                {ai.data.provider} · {ai.data.model}
+                {ai.data.provider}
+              </p>
+              <p>
+                <span className="font-medium text-slate-800 dark:text-slate-200">Model:</span>{' '}
+                {ai.data.model}
               </p>
               <p>{ai.data.message}</p>
+              {/* Model details collapsible section */}
               {ai.data.models.length > 0 && (
-                <p className="text-xs text-slate-400">Installed: {ai.data.models.join(', ')}</p>
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-xs text-slate-500 dark:text-slate-400 hover:underline">
+                    View model details ({ai.data.models.length})
+                  </summary>
+                  <p className="text-xs text-slate-400 dark:text-slate-500 overflow-x-auto">
+                    {ai.data.models.map((m, i) => (
+                      <span key={i} className="whitespace-break-all">{m}</span>
+                    ))}
+                  </p>
+                </details>
               )}
             </div>
           ) : (
