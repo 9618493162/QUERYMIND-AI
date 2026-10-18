@@ -316,7 +316,16 @@ class NVIDIAProvider:
                 latency_ms=latency_ms,
             )
 
-        if self.model not in models:
+        model_prefix = self.model.split("/")[0] if "/" in self.model else None
+        remote_models = [
+            m.split("/")[-1] if "/" in m else m for m in models
+        ]
+        model_ok = self.model in remote_models or (
+            model_prefix is not None and any(
+                m.startswith(model_prefix + "/") or m == model_prefix for m in models
+            )
+        )
+        if not model_ok:
             sample = ", ".join(models[: self.STATUS_MODEL_SAMPLE]) or "none listed"
             return AIStatus(
                 available=False,
