@@ -3,6 +3,10 @@
     {
       "source": "/api/:path*",
       "destination": "https://querymind-ai-backend-ehuz.onrender.com/api/:path*"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }
