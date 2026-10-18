@@ -20,8 +20,10 @@ def get_engine() -> Engine:
         # Pool sizing is configurable because it is per process: a managed
         # PostgreSQL instance (or a pooler in front of it) caps total
         # connections, so several uvicorn workers multiply this budget.
+        # The same effective URL Alembic uses: driver, credentials and sslmode
+        # settings are identical for the running server and for migrations.
         _engine = create_engine(
-            settings.database_url,
+            settings.effective_database_url,
             pool_pre_ping=True,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,

@@ -14,8 +14,10 @@
 #     --profile tools run --rm migrate           # explicit migration step
 #   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
 #
-# Migrations are NEVER applied automatically on startup: `migrate` only exists
-# under the `tools` profile, so a plain `up` can never alter the schema.
+# Migrations run automatically at startup, before the backend serves traffic
+# (fail-closed in production). The standalone `migrate` tool under the `tools`
+# profile remains for a release runbook that migrates before `up`; see §5 of
+# docs/deployment.md and RUN_MIGRATIONS_ON_STARTUP.
 
 name: querymind
 

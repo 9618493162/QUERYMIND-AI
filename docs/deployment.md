@@ -65,7 +65,8 @@ $EDITOR .env.production          # DOMAIN, ACME_EMAIL, APP_SECRET_KEY,
 # 2. Build the images.
 docker compose --env-file .env.production -f docker-compose.prod.yml build
 
-# 3. Apply database migrations ONCE, explicitly. (Never automatic: see §5.)
+# 3. Apply database migrations ONCE, explicitly (optional: they also run at
+#    startup, fail-closed — see §5).
 docker compose --env-file .env.production -f docker-compose.prod.yml \
   --profile tools run --rm migrate
 
@@ -100,8 +101,18 @@ anything.
 
 ## 5. Migrations
 
-Migrations are **never** applied automatically on startup. The `migrate`
-service exists only under the `tools` profile, so `up` cannot alter the schema:
+Migrations are applied **automatically during application startup**, before the
+API serves its first request: the FastAPI lifespan runs `alembic upgrade head`
+through [backend/app/db/migrate.py](../backend/app/db/migrate.py) and, in
+production, refuses to serve traffic when it fails (fail-closed), so the app
+cannot answer with `relation "users" does not exist`. Concurrent starts queue
+on a PostgreSQL advisory lock, each process migrates at most once, and only
+`upgrade` is ever executed — never a downgrade or a drop. Alembic and the
+application share the same effective `DATABASE_URL` (driver and `sslmode`
+settings included).
+
+The explicit `migrate` service (under the `tools` profile) remains available
+for a release runbook that prefers to migrate *before* rolling new containers:
 
 ```bash
 # Deploy procedure: backup → migrate → start
@@ -113,6 +124,9 @@ docker compose --env-file .env.production -f docker-compose.prod.yml up -d
 Run it once per deployment, from a single instance, before rolling new
 containers. `alembic check` (used by CI) fails on schema drift, so migrations
 and models cannot silently diverge.
+
+To disable the automatic startup step entirely — keeping migrations strictly
+release-driven — set `RUN_MIGRATIONS_ON_STARTUP=false` in `.env.production`.
 
 ## 6. Trusted proxy handling
 

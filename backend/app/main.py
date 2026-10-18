@@ -33,6 +33,7 @@ from app.core.errors import (
     unhandled_error_handler,
     validation_error_handler,
 )
+from app.db import migrate
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
@@ -54,6 +55,12 @@ async def lifespan(_app: FastAPI):
             logger.error("Configuration problem: %s", p)
         if settings.is_production:
             raise RuntimeError("Fatal configuration errors: " + "; ".join(problems))
+    # Apply pending schema migrations BEFORE serving a single request: a
+    # freshly provisioned database would otherwise reject registration with
+    # `relation "users" does not exist`. Fail-closed in production (the
+    # lifespan exception aborts startup); see app/db/migrate.py.
+    migrate.run_startup_migrations()
+
     # Verify the metadata database is reachable at startup (fail loudly).
     try:
         from sqlalchemy import text
@@ -67,6 +74,31 @@ async def lifespan(_app: FastAPI):
         logger.error("Metadata database unreachable: %s", exc.__class__.__name__)
         if settings.is_production:
             raise
+    # Verify the schema is present after running migrations; if somehow the
+    # schema is still missing (e.g. migration silently failed or was skipped),
+    # fail fast in production rather than letting registration fail later
+    # with a confusing "relation does not exist" error.
+    if settings.is_production:
+        try:
+            from sqlalchemy import inspect, text
+
+            with get_engine().connect() as conn:
+                inspector = inspect(conn)
+                tables = set(inspector.get_table_names())
+                required = {"users", "database_connections", "uploaded_datasets",
+                            "user_sessions", "user_settings", "conversations",
+                            "saved_queries", "conversation_messages", "query_history"}
+                missing = required - tables
+                if missing:
+                    raise RuntimeError(
+                        f"Schema migration check failed: missing tables {sorted(missing)}. "
+                        "Database migrations did not apply correctly."
+                    )
+            logger.info("Schema verification passed: all required tables present")
+        except Exception as ve:
+            logger.error("Schema verification error: %s", ve)
+            if settings.is_production:
+                raise
     # Operational summary (no secrets): what the app will trust at runtime.
     logger.info(
         "Runtime configuration: environment=%s origins=%s trusted_proxies=%s "

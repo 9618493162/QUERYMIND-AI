@@ -62,6 +62,11 @@ os.environ["DATABASE_URL"] = _dsn(
 os.environ["FRONTEND_ORIGIN"] = "http://localhost:5173"
 os.environ.setdefault("ENCRYPTION_KEY", "test-encryption-key-0123456789abcdef")
 os.environ["ALLOW_PRIVATE_DB_HOSTS"] = "true"
+# The suite prepares its schema itself (create_all below) and every test shares
+# one database, so startup migrations are off here. The startup migration
+# behaviour itself is covered explicitly by test_migration_startup.py, which
+# enables the flag and points the runner at its own database.
+os.environ["RUN_MIGRATIONS_ON_STARTUP"] = "false"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
