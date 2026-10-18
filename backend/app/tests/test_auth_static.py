@@ -12,11 +12,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-ROOT = Path(".")
-BACKEND_SCHEMAS = ROOT / "backend" / "app" / "schemas" / "__init__.py"
-AUTH_ROUTER = ROOT / "backend" / "app" / "api" / "auth.py"
-FRONTEND_REGISTER = ROOT / "frontend" / "src" / "pages" / "Register.tsx"
-FRONTEND_LOGIN = ROOT / "frontend" / "src" / "pages" / "Login.tsx"
+TEST_FILE = Path(__file__).resolve()
+# Go up 3 levels: test file -> backend/app/tests -> backend/app -> backend -> project root
+PROJECT_ROOT = TEST_FILE.parent.parent.parent.parent
+BACKEND_SCHEMAS = PROJECT_ROOT / "backend" / "app" / "schemas" / "__init__.py"
+AUTH_ROUTER = PROJECT_ROOT / "backend" / "app" / "api" / "auth.py"
+FRONTEND_REGISTER = PROJECT_ROOT / "frontend" / "src" / "pages" / "Register.tsx"
+FRONTEND_LOGIN = PROJECT_ROOT / "frontend" / "src" / "pages" / "Login.tsx"
 
 
 def _top_names(path: Path) -> set[str]:
